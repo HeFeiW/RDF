@@ -9,6 +9,7 @@ import torch
 import os
 import numpy as np
 np.set_printoptions(threshold=np.inf)
+CUR_DIR = os.path.dirname(os.path.realpath(__file__))
 import glob
 import trimesh
 import utils
@@ -272,7 +273,7 @@ if __name__ =='__main__':
         bp_sdf.train_bf_sdf()
 
     # load trained model
-    model_path = f'models/BP_{args.n_func}.pt'
+    model_path = CUR_DIR + f'/models/BP_{args.n_func}.pt'
     model = torch.load(model_path)
     
     # visualize the Bernstein Polynomial model for each robot link
