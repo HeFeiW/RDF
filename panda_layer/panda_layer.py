@@ -11,6 +11,7 @@ import trimesh
 import glob
 import os
 import numpy as np
+import pytorch_kinematics as pk
 import math
 
 def save_to_mesh(vertices, faces, output_mesh_path=None):
@@ -121,6 +122,9 @@ class PandaLayer(torch.nn.Module):
                 name = os.path.basename(mesh_file)[:-4].split('_')[0]
             else:
                 name = os.path.basename(mesh_file)[:-4]
+            #temp
+            name = os.path.basename(mesh_file)[:-4].split('_')[0]
+            print(f'Loading mesh: {name}')
             mesh = trimesh.load(mesh_file)
             triangle_areas = trimesh.triangles.area(mesh.triangles)
             vert_area_weight = []

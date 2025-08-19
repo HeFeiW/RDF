@@ -13,14 +13,37 @@ import mesh_to_sdf
 import skimage
 import pyrender
 import torch
+import argparse
+CUR_PATH = os.path.dirname(os.path.realpath(__file__))
+parser = argparse.ArgumentParser(description='Sample SDF points from mesh')
+parser.add_argument('--robot', type=str, default='panda',choices=['panda', 'dexhand','leaphand'],
+                    help='Robot type to sample SDF points from')
+args = parser.parse_args()
 
-mesh_path = os.path.dirname(os.path.realpath(__file__)) + "/panda_layer/meshes/voxel_128/*.stl"
+# --- initialize mesh path depending on robot type ---
+if args.robot == 'panda':
+    mesh_path = os.path.join(CUR_PATH, 'panda_layer/meshes/voxel_128/*.stl')
+elif args.robot == 'leaphand':
+    mesh_path = os.path.join(CUR_PATH, 'descriptions/leaphand/meshes/*.stl')
+elif args.robot == 'dexhand':
+    mesh_path = os.path.join(CUR_PATH, 'descriptions/dexhand/right/*.stl')
+   
+    
 mesh_files = glob.glob(mesh_path)
-mesh_files = sorted(mesh_files)[1:] #except finger
+mesh_files = sorted(mesh_files)[:] #except finger
 
 for mf in mesh_files:
+    # 先检查一下，如果已经存在数据，就跳过
+    save_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),f'data/{args.robot}/sdf_points')
+    if os.path.exists(save_path) is not True:
+        os.mkdir(save_path)
+    
     mesh_name = mf.split('/')[-1].split('.')[0]
     print(mesh_name)
+    data_path = os.path.join(save_path,f'voxel_128_{mesh_name}.npy')
+    if os.path.exists(data_path):
+        print(f"Data for {mf} already exists, skipping...")
+        continue
     mesh = trimesh.load(mf)
     mesh = mesh_to_sdf.scale_to_unit_sphere(mesh)
 
@@ -59,10 +82,8 @@ for mf in mesh_files:
         'center': center,
         'scale': scale
     }
-    save_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),f'data/sdf_points')
-    if os.path.exists(save_path) is not True:
-        os.mkdir(save_path)
-    np.save(os.path.join(save_path,f'voxel_128_{mesh_name}.npy'), data)
+    
+    np.save(data_path, data)
 
     # # # for visualization
     # data = np.load(os.path.join(os.path.join(os.path.dirname(os.path.realpath(__file__)),f'data/sdf_points/voxel_128_{mesh_name}.npy')), allow_pickle=True).item()
