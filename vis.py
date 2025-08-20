@@ -11,6 +11,7 @@
 import torch
 import os
 from panda_layer.panda_layer import PandaLayer
+from panda_layer.robot_layer import RobotLayer
 import bf_sdf
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,13 +74,14 @@ def plot_2D_panda_sdf(pose,theta,bp_sdf,nbData,model,device):
     plt.show()
 
 def plot_3D_panda_with_gradient(pose,theta,bp_sdf,model,device):  
-    robot_mesh = panda.get_forward_robot_mesh(pose, theta)[0]
+    robot_mesh = robot.get_forward_robot_mesh(pose, theta)[0]
     robot_mesh = np.sum(robot_mesh)
-
     surface_points = robot_mesh.vertices
     scene = trimesh.Scene() 
+
     # robot mesh
     scene.add_geometry(robot_mesh)
+    scene.show()
     choice = np.random.choice(len(surface_points), 1024, replace=False)
     surface_points = surface_points[choice]
     p =torch.from_numpy(surface_points).float().to(device)
@@ -87,7 +89,7 @@ def plot_3D_panda_with_gradient(pose,theta,bp_sdf,model,device):
     choice_ball = np.random.choice(len(ball_query), 1024, replace=False)
     ball_query = ball_query[choice_ball]
     p = p + torch.from_numpy(ball_query).float().to(device)*0.5
-    sdf,ana_grad = bp_sdf.get_whole_body_sdf_batch(p,pose,theta,model,use_derivative=True,used_links = [0,1,2,3,4,5,6,7,8])
+    sdf,ana_grad = bp_sdf.get_whole_body_sdf_batch(p,pose,theta,model,use_derivative=True)
     sdf,ana_grad = sdf.squeeze().detach().cpu().numpy(),ana_grad.squeeze().detach().cpu().numpy()
     # points
     pts = p.detach().cpu().numpy()
@@ -140,7 +142,8 @@ def generate_panda_mesh_sdf_points(max_dist =0.10):
 
 def vis_panda_sdf(pose, theta,device):
     data = np.load('data/panda_mesh_sdf.npy',allow_pickle=True).item()
-    trans = panda.get_transformations_each_link(pose,theta)
+    # trans = panda.get_transformations_each_link(pose,theta)
+    trans = robot.get_link_transformations(pose,theta)
     pts = []
     for i,k in enumerate(data.keys()):
         points = data[k]['points']
@@ -164,7 +167,7 @@ def vis_panda_sdf(pose, theta,device):
     pts = torch.cat(pts,dim=0).detach().cpu().numpy()
     print(pts.shape)
     scene = trimesh.Scene()
-    robot_mesh = panda.get_forward_robot_mesh(pose, theta)[0]
+    robot_mesh = robot.get_forward_robot_mesh(pose, theta)[0]
     robot_mesh = np.sum(robot_mesh)
     scene.add_geometry(robot_mesh)
     pc =trimesh.PointCloud(pts,colors = [255,0,0])
@@ -179,13 +182,20 @@ if __name__ =='__main__':
     parser.add_argument('--domain_min', default=-1.0, type=float)
     parser.add_argument('--n_func', default=8, type=float)
     parser.add_argument('--train', action='store_true')
+    parser.add_argument('--robot', default='panda', type=str,choices=['panda','dexhand','leaphand'])
     args = parser.parse_args()
-
-    panda = PandaLayer(args.device)
-    bp_sdf = bf_sdf.BPSDF(args.n_func,args.domain_min,args.domain_max,panda,args.device)
+    CUR_DIR = os.path.dirname(os.path.realpath(__file__))
+    paths = {
+        'urdf': os.path.join(CUR_DIR,f'descriptions/{args.robot}/*.urdf'),
+        'meshes': os.path.join(CUR_DIR,f'descriptions/{args.robot}/meshes/*.stl'),
+        'points': os.path.join(CUR_DIR,f'data/{args.robot}/sdf_points/'),
+        'model':os.path.join(CUR_DIR, f'models/{args.robot}/BP_{args.n_func}.pt')
+        }
+    robot = RobotLayer(device=args.device,paths=paths,robot='panda')
+    bp_sdf = bf_sdf.BPSDF(args.n_func,args.domain_min,args.domain_max,robot,paths,args.device)
 
     #  load  model
-    model = torch.load(f'models/BP_{args.n_func}.pt')
+    model = torch.load(f'models/{args.robot}//BP_{args.n_func}.pt')
 
     # initial the robot configuration
     theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, np.pi/4]).float().to(args.device).reshape(-1,7)

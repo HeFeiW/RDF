@@ -78,6 +78,8 @@ class BPSDF():
         mesh_dict = {}
         for i,mf in enumerate(mesh_files):
             mesh_name = mf.split('/')[-1].split('.')[0]
+            if '_vis' in mesh_name:
+                mesh_name = mesh_name.replace('_vis','')
             mesh = trimesh.load(mf)
             offset = mesh.bounding_box.centroid
             scale = np.max(np.linalg.norm(mesh.vertices-offset, axis=1))
@@ -112,7 +114,7 @@ class BPSDF():
                 # loss_list.append(loss)
                 wb += delta_wb
 
-            print(f'mesh name {mesh_name} finished!')
+            # print(f'mesh name {mesh_name} finished!')
             mesh_dict[mesh_name] ={
                 'mesh_name':     mesh_name,
                 'weights':  wb,
@@ -130,7 +132,7 @@ class BPSDF():
         for i, k in enumerate(model.keys()):
             mesh_dict = model[k]
             mesh_name = mesh_dict['mesh_name']
-            print(f'{mesh_name}')
+            # print(f'{mesh_name}')
             mesh_name_list.append(mesh_name)
             weights = mesh_dict['weights'].to(self.device)
 
@@ -168,36 +170,56 @@ class BPSDF():
                     os.mkdir(save_path)
                 trimesh.exchange.export.export_mesh(rec_mesh, os.path.join(save_path,f"{save_mesh_name}_{mesh_name}.stl"))
 
-    def get_whole_body_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = [0,1,2,3,4,5,6,7,8],return_index=False):
+    def get_whole_body_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = None,return_index=False):
         # x: (Nx,3)  query points in world frame
         # pose: (B,4,4)  base pose in world frame
         # theta: (B,DoF)  joint angles
         # model: dict of mesh model
         # used_links: list of link index to use,！！！这里实际上并没有用到，因为除了panda，两个手都是用的全部link！！！
+        if used_links is None:
+            used_links = self.robot.all_links
+        used_links = [link for link in used_links if self.robot.Link2Mesh[link] is not None]
         B = len(theta)
         N = len(x)
         K = len(used_links)
-        print(f'Batch size: {B}, Number of links: {K}, Number of points: {N}')
-        print(f'Used links: {used_links}')
+        # print(f'Batch size: {B}, Number of links: {K}, Number of points: {N}')
+        # print(f'Used links: {used_links}')
+        # print(f'model keys: {model.keys()}')
         offset = torch.cat([model[self.robot.Link2Mesh[link]]['offset'].unsqueeze(0) for link in used_links],dim=0).to(self.device)
         offset = offset.unsqueeze(0).expand(B,K,3).reshape(B*K,3).float()
         scale = torch.tensor([model[self.robot.Link2Mesh[link]]['scale'] for link in used_links],device=self.device)
         scale = scale.unsqueeze(0).expand(B,K).reshape(B*K).float()
-        trans_list_temp = [self.robot.get_link_transformations(pose, t) for t in theta]
-        trans_list_2 = torch.stack(trans_list_temp, dim=0).to(self.device) # B,K,4,4
-        used_trans = []
-        for link in used_links:
-            for ee_link in trans_list_2:
-                if link in trans_list_2[ee_link]:
-                    used_trans.append(trans_list_2[ee_link][link])
-                    break
-        used_trans = torch.stack(used_trans,dim=0).permute(1,0,2,3).reshape(-1,4,4)
-        # print(f'used_trans shape:{used_trans.shape}')
-        # used_trans = used_trans.permute(1,0,2,3).reshape(-1,4,4)  # (B*K,4,4)    
-        # print(f'used_trans shape after perm:{used_trans.shape}')
-        # fk_trans = torch.cat([t.unsqueeze(1) for t in trans_list],dim=1)[:,used_links,:,:].reshape(-1,4,4) # fk_trans:(B*K,4,4)
-        # print(f'fk_trans_shape: {fk_trans.shape}')
-        x_robot_frame_batch = utils.transform_points(x.float(),torch.linalg.inv(used_trans).float(),device=self.device) # B*K,N,3
+        trans = self.robot.get_link_transformations(pose, theta)
+        # print(f'trans shape:{trans.shape}')
+        # print(f'x shape:{x.shape}')
+        # 在trans (links,B,4*4)中只保留used_links的transformation(变为（K，4，4）)
+        # mask = torch.tensor([],dtype=torch.bool)
+        # for ee_link in self.robot.ee_links:
+        #     for name in self.robot.chain[ee_link].get_link_names():
+        #         if name not in used_links:
+        #             mask.append(False)
+        #         else:
+        #             mask.append(True)
+        # # x: (N,3)  query points in world frame
+        # # trans: (B,K,4,4)  -> (B*K,4,4)
+        # trans=torch.gather()
+        used_indices = [self.robot.all_links.index(link) for link in used_links if link in self.robot.all_links]
+        # print(f'used_indices: {used_indices}')
+        trans = trans[used_indices]  # (K, B, 4, 4)
+        # print(f'trans shape after gather:{trans.shape}')
+        trans = trans.reshape(-1,4,4).float()
+        # # --- check if the transformation is correct ---
+        # print(f'pose shape: {pose.shape}, theta shape: {theta.shape}')
+        # print(f'trans shape: {trans.shape}')
+        # if torch.isnan(trans).any() or torch.isinf(trans).any():
+        #     print('Warning: trans contains NaN or Inf!')
+        #     trans = torch.where(torch.isnan(trans), torch.zeros_like(trans), trans)
+        #     trans = torch.where(torch.isinf(trans), torch.zeros_like(trans), trans)
+        # dets = torch.det(trans)
+        # print('Min det:', dets.min().item(), 'Max det:', dets.max().item())
+        # print('Any det==0:', (dets==0).any().item())
+        # 可选：只对可逆的矩阵做逆运算
+        x_robot_frame_batch = utils.transform_points(x.float(),torch.linalg.inv(trans).float(),device=self.device) # B*K,N,3
         x_robot_frame_batch_scaled = x_robot_frame_batch - offset.unsqueeze(1)
         x_robot_frame_batch_scaled = x_robot_frame_batch_scaled/scale.unsqueeze(-1).unsqueeze(-1) #B*K,N,3
 
@@ -215,6 +237,7 @@ class BPSDF():
             sdf = sdf.reshape(B,K,N)
             sdf = sdf*scale.reshape(B,K).unsqueeze(-1)
             sdf_value, idx = sdf.min(dim=1)
+            print(f'sdf_min: {sdf_value.min()}, sdf_max: {sdf_value.max()},sdf_mean: {sdf_value.mean()}')
             if return_index:
                 return sdf_value, None, idx
             return sdf_value, None
@@ -233,11 +256,12 @@ class BPSDF():
             sdf = sdf.reshape(B,K,N)
             sdf = sdf*(scale.reshape(B,K).unsqueeze(-1))
             sdf_value, idx = sdf.min(dim=1)
+            print(f'sdf_min: {sdf_value.min()}, sdf_max: {sdf_value.max()},sdf_mean: {sdf_value.mean()}')
             # derivative
             gradient = res_x + torch.nn.functional.normalize(gradient,dim=-1)
             gradient = torch.nn.functional.normalize(gradient,dim=-1).float()
             # gradient = gradient.reshape(B,K,N,3)
-            fk_rotation = used_trans[:,:3,:3]
+            fk_rotation = trans[:,:3,:3]
             gradient_base_frame = torch.einsum('ijk,ikl->ijl',fk_rotation,gradient.transpose(1,2)).transpose(1,2).reshape(B,K,N,3)
             # norm_gradient_base_frame = torch.linalg.norm(gradient_base_frame,dim=-1)
 
@@ -251,25 +275,26 @@ class BPSDF():
                 return sdf_value, gradient_value, idx
             return sdf_value, gradient_value
 
-    def get_whole_body_sdf_with_joints_grad_batch(self,x,pose,theta,model,used_links = [0,1,2,3,4,5,6,7,8]):
-        sdf = {}
-        d_sdf = {}
-        for t in theta.values():
-            delta = 0.001
-            B = t.shape[0]
-            DoF = t.shape[1]
-            t = t.unsqueeze(1)
-            d_theta = (t.expand(B,DoF,DoF)+ torch.eye(DoF,device=self.device).unsqueeze(0).expand(B,DoF,DoF)*delta).reshape(B,-1,DoF)
-            t = torch.cat([t,d_theta],dim=1).reshape(B*(DoF+1),DoF)
-            pose = pose.unsqueeze(1).expand(B,(DoF+1),4,4).reshape(B*(DoF+1),4,4)
-            sdf,_ = self.get_whole_body_sdf_batch(x,pose,t,model,use_derivative = False, used_links = used_links)
-            sdf = sdf.reshape(B,(DoF+1),-1)
-            d_sdf = (sdf[:,1:,:]-sdf[:,:1,:])/delta
-            sdf[t] = sdf[:,0,:]
-            d_sdf[t] = d_sdf.transpose(1,2)
-        return sdf,d_sdf
+    def get_whole_body_sdf_with_joints_grad_batch(self,x,pose,theta,model,used_links = None):
+        if used_links is None:
+            used_links = self.robot.all_links
+        used_links = [link for link in used_links if self.robot.Link2Mesh[link]is not None]
+        delta = 0.001
+        B = theta.shape[0]
+        DoF = theta.shape[1]
+        theta = theta.unsqueeze(1)
+        d_theta = (theta.expand(B,DoF,DoF)+ torch.eye(DoF,device=self.device).unsqueeze(0).expand(B,DoF,DoF)*delta).reshape(B,-1,DoF)
+        theta = torch.cat([theta,d_theta],dim=1).reshape(B*(DoF+1),DoF)
+        pose = pose.unsqueeze(1).expand(B,(DoF+1),4,4).reshape(B*(DoF+1),4,4)
+        sdf,_ = self.get_whole_body_sdf_batch(x,pose,theta,model,use_derivative = False, used_links = used_links)
+        sdf = sdf.reshape(B,(DoF+1),-1)
+        d_sdf = (sdf[:,1:,:]-sdf[:,:1,:])/delta
+        return sdf[:,0,:], d_sdf.transpose(1,2)
 
-    def get_whole_body_normal_with_joints_grad_batch(self,x,pose,theta,model,used_links = [0,1,2,3,4,5,6,7,8]):
+    def get_whole_body_normal_with_joints_grad_batch(self,x,pose,theta,model,used_links = None):
+        if used_links is None:
+            used_links = self.robot.all_links
+        used_links = [link for link in used_links if self.robot.Link2Mesh[link]is not None]
         normals = {}
         for t in theta.values():
             delta = 0.001
@@ -312,44 +337,34 @@ if __name__ =='__main__':
     if args.eval:
         # load trained model
         model = torch.load(paths['model'])
-        print('model loaded!',model.keys())
+        # print('model loaded!',model.keys())
         # visualize the Bernstein Polynomial model for each robot link
         bp_sdf.create_surface_mesh(model,nbData=128,vis=False,save_mesh_name=f'BP_{args.n_func}')
 
         # visualize the Bernstein Polynomial model for the whole body
-        theta = {}
-        for ee_link in robot.ee_links:
-            DoF = robot.DoFs[ee_link]
-            theta[ee_link] = torch.rand(1, DoF).to(args.device).float()
-            
+        B=11
+        theta = torch.cat([torch.zeros(1,robot.DoFs[ee_link]).float() for ee_link in robot.ee_links],dim=-1).to(args.device)
+        theta = theta.expand(B,-1)
+        # print('theta shape:',theta.shape)
         
         # theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, np.pi/4]).float().to(args.device).reshape(-1,7)
         pose = torch.from_numpy(np.identity(4)).to(args.device).reshape(-1, 4, 4).expand(len(theta),4,4).float()
         # trans_list = robot.get_transformations_each_link(pose,theta)
         # print(trans_list)
         
-        print('------------------------------------------------------------')
+        # print('------------------------------------------------------------')
         trans_list = robot.get_link_transformations(pose, theta)
         # print(trans_list)
         
         # run RDF 
         x = torch.rand(128,3).to(args.device)*2.0 - 1.0
-        Nt = 11
-        theta = []
-        for i in range(Nt):
-            theta.append({})
-            for ee_link in robot.ee_links:
-                DoF = robot.DoFs[ee_link]
-                theta[i][ee_link] = torch.rand(1, DoF).to(args.device).float()
-        pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(Nt,4,4).float()
+        pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(B,4,4).float()
         used_link = robot.all_links
-        # 除去palm_base
-        used_link = [link for link in used_link if link != 'palm_base']
-        print('used link:',used_link)
+        # print('used link:',used_link)
         sdf,gradient = bp_sdf.get_whole_body_sdf_batch(x,pose,theta,model,use_derivative=True,used_links = used_link)
-        print('sdf:',sdf,'gradient:',gradient)
-        sdf,joint_grad = bp_sdf.get_whole_body_sdf_with_joints_grad_batch(x,pose,theta,model)
-        print('sdf:',sdf,'joint gradient:',joint_grad)
+        # print('sdf:',sdf,'gradient:',gradient)
+        sdf,joint_grad = bp_sdf.get_whole_body_sdf_with_joints_grad_batch(x,pose,theta,model,used_links= used_link)
+        # print('sdf:',sdf,'joint gradient:',joint_grad)
 
 
 

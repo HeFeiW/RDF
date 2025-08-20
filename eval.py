@@ -26,20 +26,21 @@ if  __name__ =='__main__':
     parser.add_argument('--type', default='RDF', type=str)
     parser.add_argument('--vis', action='store_true')
     parser.add_argument('--vis_rec_robot_surface', action='store_true')
+    parser.add_argument('--robot', default='panda', type=str)
     args = parser.parse_args()
 
-    data = np.load(f'./data/sdf_points/test_data.npy',allow_pickle=True).item()
+    data = np.load(f'./data/panda/test_data.npy',allow_pickle=True).item()
     panda = PandaLayer(args.device)
 
     if args.method == 'BP_8':
         bpSdf = bf_sdf.BPSDF(8,-1,1,panda,args.device)
-        model = torch.load(f'models/{args.method}.pt')
+        model = torch.load(f'models/{args.robot}/{args.method}.pt')
     elif args.method == 'BP_24':
         bpSdf = bf_sdf.BPSDF(24,-1,1,panda,args.device)
-        model = torch.load(f'models/{args.method}.pt')
+        model = torch.load(f'models/{args.robot}/{args.method}.pt')
     elif args.method == 'NN_LD' or args.method == 'NN_AD':
         nnSdf = nn_sdf.NNSDF(panda,device=args.device)
-        model = torch.load(f'models/{args.method}.pt')
+        model = torch.load(f'models/{args.robot}/{args.method}.pt')
     elif args.method == 'Sphere':
         sphere_sdf = sphere.SphereSDF(args.device)
         with open(os.path.join(CUR_DIR,'panda_layer/franka_sphere.yaml'), 'r') as f:
