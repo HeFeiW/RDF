@@ -97,17 +97,35 @@ def plot_3D_panda_with_gradient(pose,theta,bp_sdf,model,device):
     colors[:,0] = np.abs(sdf)*400
     # pc =trimesh.PointCloud(pts,colors)
     # scene.add_geometry(pc)
-
-    # gradients
-    for i in range(len(pts)):
+    # for i in range(len(pts)):
+    #     dg = ana_grad[i]
+    #     if dg.sum() ==0:
+    #         continue
+    #     c = colors[i]
+    #     print(c)
+    #     m = utils.create_arrow(-dg,pts[i],vec_length = 0.05,color=c)
+    #     scene.add_geometry(m)
+    # scene.show()   
+    space_limits = np.array([[-0.5,-0.5,0.0],[0.5,0.5,1.0]])
+    N = 20
+    points = np.random.rand(N,3) * (space_limits[1]-space_limits[0]) + space_limits[0]
+    points = torch.from_numpy(points).float().to(device)
+    sdf,ana_grad = bp_sdf.get_whole_body_sdf_batch(points,pose,theta,model,use_derivative=True)
+    sdf,ana_grad = sdf.squeeze().detach().cpu().numpy(),ana_grad.squeeze().detach().cpu().numpy()
+    # 在的空间中画一个0.1*0.1*0.1的立方体
+    scene.add_geometry(trimesh.creation.box(extents=[0.1,0.1,0.1],transform=trimesh.transformations.translation_matrix([0,0,0.05]),color=[0,255,0,100]))
+    for i in range(len(points)):
         dg = ana_grad[i]
         if dg.sum() ==0:
             continue
-        c = colors[i]
-        print(c)
-        m = utils.create_arrow(-dg,pts[i],vec_length = 0.05,color=c)
+        c = [0,0,255]
+        m = utils.create_arrow(-dg,points[i].detach().cpu().numpy(),vec_length = 0.05,color=c)
         scene.add_geometry(m)
-    scene.show()   
+        print(f'{i} point: {points[i]}, sdf: {sdf[i]}')
+    scene.show()
+        # c = input()
+    # gradients
+    
 
 def generate_panda_mesh_sdf_points(max_dist =0.10):
     # represent SDF using basis functions
@@ -198,7 +216,8 @@ if __name__ =='__main__':
     model = torch.load(f'models/{args.robot}//BP_{args.n_func}.pt')
 
     # initial the robot configuration
-    theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, np.pi/4]).float().to(args.device).reshape(-1,7)
+    # theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, 0]).float().to(args.device).reshape(-1,7)
+    theta = torch.zeros([1,7]).float().to(args.device).reshape(-1,7)
     pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(len(theta),4,4).float()
 
     # # vis 2D SDF with gradient

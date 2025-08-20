@@ -48,6 +48,7 @@ class RobotLayer(torch.nn.Module):
         self.urdf_path = urdf_files[0]  # 取第一个匹配的URDF文件
         
         # --- initialize link chain ---
+        print('robot', robot)
         if robot == 'panda':
             self.ee_links = ['panda_hand']
             self.Link2Mesh = {
@@ -99,7 +100,6 @@ class RobotLayer(torch.nn.Module):
             # print(self.chain[ee_link])
         # --- initialize meshes ---
         self.meshes = self.load_meshes()
-        print(f'self.all_links: {self.all_links}')
         
         # --- initialize joint limits ---
         if robot == 'panda':
@@ -141,7 +141,10 @@ class RobotLayer(torch.nn.Module):
         idx = 0
         transformation = torch.tensor([]).to(self.device)
         for ee_link in self.ee_links:
-            
+            # if self.robot == 'panda' and ee_link == 'panda_hand':#TODO 似乎panda也没有设置最后一个关节
+            #     # panda的最后一个关节是固定的，角度为-np.pi/4, 故在theta后增加
+            #     print('panda_hand has fixed joint -np.pi/4')
+            #     theta = torch.cat([theta, -np.pi/4*torch.ones_like(theta[:,0:1])], dim=1)
             # print(f'Computing transformations for {ee_link}')
             temp_trans = self.chain[ee_link].forward_kinematics(theta[:,idx:idx+self.DoFs[ee_link]],end_only=False)
             temp_trans = torch.stack([temp_trans[k].get_matrix() for k in temp_trans.keys()],dim=0)
@@ -170,7 +173,7 @@ class RobotLayer(torch.nn.Module):
             else:
                 name = os.path.basename(mesh_file)[:-4]
             mesh = trimesh.load(mesh_file)
-            print(f'Loading mesh for {name}')
+            # print(f'Loading mesh for {name}')
             temp = torch.ones(mesh.vertices.shape[0], 1).float()
             meshes[name] = [
                 torch.cat((torch.FloatTensor(np.array(mesh.vertices)), temp), dim=-1).to(self.device),
@@ -181,27 +184,18 @@ class RobotLayer(torch.nn.Module):
 
     def forward(self, pose, theta):
         batch_size = theta.shape[0]
-        print('batch size', batch_size)
+        # print('batch size', batch_size)
         current_pose = pose.view(batch_size, 4, 4)
         vertices ={k: v[0].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 4)}
         normals = {k: v[-1].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 3)}
-        faces = {k: v[1] for k,v in self.meshes.items()}
-        akey = list(self.meshes.keys())[0]
-        print(akey)
-        print('vertices1 shape',vertices[akey].shape)
-        print(f'normals shape:{normals[akey].shape}')
-        vertices = {k: torch.matmul(current_pose, v.transpose(2, 1)).transpose(2, 1)[:, :, :3] for k,v in vertices.items()}
-        normals = {k: torch.matmul(current_pose, v.transpose(2, 1)).transpose(2, 1)[:, :, :3] for k,v in normals.items()}
-
         trans = self.get_link_transformations(pose, theta)
-        print(trans)
+        # print(trans.shape)
+        # trans : (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)
+        # print(trans)
+        
         c=input()
         # the keys of vertices and normals are the same, and are mesh names(instead of link names)
-        print(f'trans shape:{trans.shape}')
 
-        print(f'vertices shape:{vertices[akey].shape}')
-        print(f'normals shape:{normals[akey].shape}')
-        print(f'vertices keys: {vertices.keys()}')
         transformed_vertices = {}
         transformed_normals = {}
         for i, link in enumerate(self.all_links):
@@ -210,9 +204,12 @@ class RobotLayer(torch.nn.Module):
                 mesh_name = self.Link2Mesh[link]
                 # transformed_vertices[link] = torch.matmul(vertices[mesh_name],trans[link_idx,:,:3,:3])#TODO why transpose?
                 # transformed_normals[link] = torch.matmul(normals[mesh_name],trans[link_idx,:,:3,:3])
-                transformed_vertices[link] = torch.matmul(vertices[mesh_name],trans[link_idx,:,:3,:3])
-                transformed_normals[link] = torch.matmul(normals[mesh_name],trans[link_idx,:,:3,:3])
-                print(f'link: {link}, vertices shape: {transformed_vertices[link].shape}, normals shape: {transformed_normals[link].shape}')
+                transformed_vertices[link] = torch.matmul(trans[link_idx,:,:,:], vertices[mesh_name].transpose(2, 1)).transpose(1, 2)
+                # print(f'transformed_vertices[link].shape{transformed_vertices[link].shape}')
+                transformed_vertices[link] = transformed_vertices[link][:, :, :3]  # remove the homogeneous coordinate
+                transformed_normals[link] = torch.matmul(trans[link_idx,:,:,:], normals[mesh_name].transpose(2, 1)).transpose(1, 2)
+                transformed_normals[link] = transformed_normals[link][:, :, :3]
+                # print(f'link: {link}, vertices shape: {transformed_vertices[link].shape}, normals shape: {transformed_normals[link].shape}')
             # vertices[link] = torch.matmul(vertices[link],trans[link_idx,:,:3,:3].transpose(2,
         # transeformed_vertices : (link, (B, Nv, 3))
         # transeformed_normals : (link, (B, Nv, 3))
@@ -260,27 +257,14 @@ class RobotLayer(torch.nn.Module):
         links_cnt = 0
         meshes = [trimesh.Trimesh(vertices_list[link].detach().cpu().numpy(), faces[self.Link2Mesh[link]]) for link in vertices_list.keys()]
         return meshes
-        print(f'len of vertices_list: {len(vertices_list)}')
-        print(f'len of links_vert: {len(links_vert)}')
-        print(f'len of links_face: {len(links_face)}')
-        print(f'links_cnt: {links_cnt}')
-        print(f"vertices_list[0]: {vertices_list[0].shape}")
-        for i in range(links_cnt):
-            print(f"links_vert[{i}]: {links_vert[i].shape}")
-            print(f"links_face[{i}]: {links_face[i].shape}")
-        meshes = [trimesh.Trimesh(links_vert[i], links_face[i]) for i in range(links_cnt)] 
-        # meshes : (B, Nl) Nl=number of links that have meshes, 
-        # may have repeated links if the robot has multiple ee_links
-        print(f'len of meshes: {len(meshes)}')
-        return meshes       
 
     def get_forward_robot_mesh(self, pose, theta):
         batch_size = pose.size()[0]
         vertices, normals = self.forward(pose, theta)
         # vertices : (link, (B, Nv, 3))
         # normals : (link, (B, Nv, 3))
-        print(f'vertices keys: {vertices.keys()}')
-        print(f'self.Link2Mesh keys: {self.Link2Mesh.keys()}')
+        # print(f'vertices keys: {vertices.keys()}')
+        # print(f'self.Link2Mesh keys: {self.Link2Mesh.keys()}')
         for k in vertices.keys():
             B = vertices[k].shape[0]
             break
@@ -289,7 +273,7 @@ class RobotLayer(torch.nn.Module):
         # if the robot have repeated links (because of multiple ee_links)
         # it will hit only once
         vertices_list = [{k:temp_vertices_list[k][b] for k in temp_vertices_list.keys()} for b in range(B)]
-        print(f'vertices_list len: {len(vertices_list)}, vertices_list[0] len: {len(vertices_list[0])}')
+        # print(f'vertices_list len: {len(vertices_list)}, vertices_list[0] len: {len(vertices_list[0])}')
         # vertices_list : (B, {link,(Nv, 3)}) there are Nlm links （the links that have meshes) 
         # self.robot_faces : dict (mesh_name:Nm)      
         mesh = [self.get_robot_mesh(vertices, self.robot_faces) for vertices in vertices_list]

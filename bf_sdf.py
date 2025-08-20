@@ -190,35 +190,11 @@ class BPSDF():
         scale = torch.tensor([model[self.robot.Link2Mesh[link]]['scale'] for link in used_links],device=self.device)
         scale = scale.unsqueeze(0).expand(B,K).reshape(B*K).float()
         trans = self.robot.get_link_transformations(pose, theta)
-        # print(f'trans shape:{trans.shape}')
-        # print(f'x shape:{x.shape}')
-        # 在trans (links,B,4*4)中只保留used_links的transformation(变为（K，4，4）)
-        # mask = torch.tensor([],dtype=torch.bool)
-        # for ee_link in self.robot.ee_links:
-        #     for name in self.robot.chain[ee_link].get_link_names():
-        #         if name not in used_links:
-        #             mask.append(False)
-        #         else:
-        #             mask.append(True)
-        # # x: (N,3)  query points in world frame
-        # # trans: (B,K,4,4)  -> (B*K,4,4)
-        # trans=torch.gather()
         used_indices = [self.robot.all_links.index(link) for link in used_links if link in self.robot.all_links]
         # print(f'used_indices: {used_indices}')
         trans = trans[used_indices]  # (K, B, 4, 4)
         # print(f'trans shape after gather:{trans.shape}')
         trans = trans.reshape(-1,4,4).float()
-        # # --- check if the transformation is correct ---
-        # print(f'pose shape: {pose.shape}, theta shape: {theta.shape}')
-        # print(f'trans shape: {trans.shape}')
-        # if torch.isnan(trans).any() or torch.isinf(trans).any():
-        #     print('Warning: trans contains NaN or Inf!')
-        #     trans = torch.where(torch.isnan(trans), torch.zeros_like(trans), trans)
-        #     trans = torch.where(torch.isinf(trans), torch.zeros_like(trans), trans)
-        # dets = torch.det(trans)
-        # print('Min det:', dets.min().item(), 'Max det:', dets.max().item())
-        # print('Any det==0:', (dets==0).any().item())
-        # 可选：只对可逆的矩阵做逆运算
         x_robot_frame_batch = utils.transform_points(x.float(),torch.linalg.inv(trans).float(),device=self.device) # B*K,N,3
         x_robot_frame_batch_scaled = x_robot_frame_batch - offset.unsqueeze(1)
         x_robot_frame_batch_scaled = x_robot_frame_batch_scaled/scale.unsqueeze(-1).unsqueeze(-1) #B*K,N,3
@@ -237,7 +213,7 @@ class BPSDF():
             sdf = sdf.reshape(B,K,N)
             sdf = sdf*scale.reshape(B,K).unsqueeze(-1)
             sdf_value, idx = sdf.min(dim=1)
-            print(f'sdf_min: {sdf_value.min()}, sdf_max: {sdf_value.max()},sdf_mean: {sdf_value.mean()}')
+            print(f'sdf_values:{sdf_value}, idx:{idx}')
             if return_index:
                 return sdf_value, None, idx
             return sdf_value, None
@@ -256,7 +232,7 @@ class BPSDF():
             sdf = sdf.reshape(B,K,N)
             sdf = sdf*(scale.reshape(B,K).unsqueeze(-1))
             sdf_value, idx = sdf.min(dim=1)
-            print(f'sdf_min: {sdf_value.min()}, sdf_max: {sdf_value.max()},sdf_mean: {sdf_value.mean()}')
+            print(f'sdf_values:{sdf_value}, idx:{idx}')
             # derivative
             gradient = res_x + torch.nn.functional.normalize(gradient,dim=-1)
             gradient = torch.nn.functional.normalize(gradient,dim=-1).float()
@@ -362,9 +338,9 @@ if __name__ =='__main__':
         used_link = robot.all_links
         # print('used link:',used_link)
         sdf,gradient = bp_sdf.get_whole_body_sdf_batch(x,pose,theta,model,use_derivative=True,used_links = used_link)
-        # print('sdf:',sdf,'gradient:',gradient)
+        print('sdf:',sdf,'gradient:',gradient)
         sdf,joint_grad = bp_sdf.get_whole_body_sdf_with_joints_grad_batch(x,pose,theta,model,used_links= used_link)
-        # print('sdf:',sdf,'joint gradient:',joint_grad)
+        print('sdf:',sdf,'joint gradient:',joint_grad)
 
 
 
