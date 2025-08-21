@@ -20,8 +20,10 @@ import glob
 import os
 import numpy as np
 import pytorch_kinematics as pk
+import xml.etree.ElementTree as ET
 import math
 import argparse
+import utils
 
 def save_to_mesh(vertices, faces, output_mesh_path=None):
     assert output_mesh_path is not None
@@ -40,83 +42,68 @@ class RobotLayer(torch.nn.Module):
         self.device = device
         self.robot = robot
         # --- initialize mesh path and urdf path ---
+        self.paths = paths
         self.mesh_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), paths['meshes'])
         urdf_glob_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), paths['urdf'])
         urdf_files = glob.glob(urdf_glob_path)
         if len(urdf_files) == 0:
             raise FileNotFoundError(f"No URDF file found at {urdf_glob_path}")
-        self.urdf_path = urdf_files[0]  # 取第一个匹配的URDF文件
+        self.paths['urdf'] = urdf_files[0]  # 取第一个匹配的URDF文件
         
         # --- initialize link chain ---
         print('robot', robot)
         if robot == 'panda':
-            self.ee_links = ['panda_hand']
-            self.Link2Mesh = {
-                'panda_hand': None,
-                'panda_link8': 'link8',
-                'panda_link7': 'link7',
-                'panda_link6': 'link6',
-                'panda_link5': 'link5',
-                'panda_link4': 'link4',
-                'panda_link3': 'link3',
-                'panda_link2': 'link2',
-                'panda_link1': 'link1',
-                'panda_link0': 'link0'
-            }
+            self.ee_links = ['panda_leftfinger', 'panda_rightfinger']
+            self.space_limits = torch.tensor([[-0.5,-0.5,0],[0.5,0.5,1.0]])
         elif robot == 'dexhand':
-            self.ee_links = ['ring_tip_1','pinky_tip_1','middle_tip_1','index_tip_1','thumb_tip_1']
+            self.ee_links = ['ring_tip_1','pinky_tip_1','middle_tip_1','index_tip_1','thumb_tip_1','hand-cover_1']
+            self.space_limits = torch.tensor([[-0.3,-0.2,0.2],[0.3,0.2,0.4]])
         elif robot == 'leaphand':
             self.ee_links = ['fingertip','fingertip_2','fingertip_3','thumb_fingertip']
-            self.Link2Mesh = {
-                'palm_base': None,
-                'palm_lower_left': 'palm_lower_left',
-                'mcp_joint': 'mcp_joint',
-                'pip': 'pip',
-                'dip': 'dip',
-                'fingertip': 'fingertip',
-                'mcp_joint_2': 'mcp_joint',
-                'pip_2': 'pip',
-                'dip_2': 'dip',
-                'fingertip_2': 'fingertip',
-                'mcp_joint_3': 'mcp_joint',
-                'pip_3': 'pip',
-                'dip_3': 'dip',
-                'fingertip_3': 'fingertip',
-                'thumb_left_temp_base': 'thumb_left_temp_base',
-                'thumb_pip': 'thumb_pip',
-                'thumb_dip': 'thumb_dip',
-                'thumb_fingertip': 'thumb_fingertip'
-            }
+            self.space_limits = torch.tensor([[-0.3,-0.3,-0.15],[0.1,0.1,0.2]])
         self.chain = {}
         self.transformations = {}
         self.DoFs = {}
         self.all_links = []
         for ee_link in self.ee_links:
-            self.chain[ee_link] = pk.build_serial_chain_from_urdf(open(self.urdf_path).read().encode(),ee_link).to(dtype=torch.float32, device=self.device)
+            self.chain[ee_link] = pk.build_serial_chain_from_urdf(open(self.paths['urdf']).read().encode(),ee_link).to(dtype=torch.float32, device=self.device)
+            
             self.DoFs[ee_link] = len(self.chain[ee_link].get_joint_parameter_names())
             self.all_links += self.chain[ee_link].get_link_names()
             # print(f'Chain for {ee_link} initialized with DoF: {self.DoFs[ee_link]}')
             self.transformations[ee_link] = self.chain[ee_link].forward_kinematics(torch.zeros(1,self.DoFs[ee_link]).to(self.device))
-            # print(self.chain[ee_link])
         # --- initialize meshes ---
         self.meshes = self.load_meshes()
-        
-        # --- initialize joint limits ---
-        if robot == 'panda':
-            self.theta_min = torch.tensor([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175,  -2.8973]).to(self.device)
-            self.theta_max = torch.tensor([ 2.8973,	1.7628,	 2.8973,  -0.0698,  2.8973,	3.7525,	 2.8973]).to(self.device)
-        elif robot == 'dexhand':
-            #TODO
-            pass
-        elif robot == 'leaphand':
-            self.theta_min =  torch.from_numpy(np.array([\
-                    -1.5716, -0.4416, -1.2216, -1.3416,  1.0192,  0.0716,  0.2516, -1.3416,\
-                    -1.5716, -0.4416, -1.2216, -1.3416, -1.5716, -0.4416, -1.2216, -1.3416\
-                ])).to(self.device)
-            self.theta_max = torch.from_numpy(np.array([\
-                    1.5584, 1.8584, 1.8584, 1.8584, 1.7408, 1.0684, 1.8584, 1.8584, 1.5584,\
-                    1.8584, 1.8584, 1.8584, 1.5584, 1.8584, 1.8584, 1.8584\
-                ])).to(self.device)
+        self.parse_urdf_origins(self.paths['urdf'])
+        self.parse_link2mesh(self.paths['urdf'])
+        # --- initialize joints ---
+        joints_info_dict = {}
+        for ee_link in self.ee_links:
+            low, high = self.chain[ee_link].get_joint_limits()
+            joints = self.chain[ee_link].get_joint_parameter_names()
+            for i in range(len(joints)):
+                joints_info_dict[joints[i]] = [low[i], high[i]]
+        self.dof = len(joints_info_dict)
+        self.joints_limits = [joints_info_dict[joint] for joint in joints_info_dict.keys()]
+        self.Joint2Idx = {joint: idx for idx, joint in enumerate(joints_info_dict.keys())}
+        # # --- initialize joint limits ---
+        # if robot == 'panda':
+        #     self.theta_min = torch.tensor([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175,  -2.8973]).to(self.device)
+        #     self.theta_max = torch.tensor([ 2.8973,	1.7628,	 2.8973,  -0.0698,  2.8973,	3.7525,	 2.8973]).to(self.device)
+        # elif robot == 'dexhand':
+        #     #TODO
+        #     pass
+        # elif robot == 'leaphand':
+        #     self.theta_min =  torch.from_numpy(np.array([\
+        #             -1.5716, -0.4416, -1.2216, -1.3416,  1.0192,  0.0716,  0.2516, -1.3416,\
+        #             -1.5716, -0.4416, -1.2216, -1.3416, -1.5716, -0.4416, -1.2216, -1.3416\
+        #         ])).to(self.device)
+        #     self.theta_max = torch.from_numpy(np.array([\
+        #             1.5584, 1.8584, 1.8584, 1.8584, 1.7408, 1.0684, 1.8584, 1.8584, 1.5584,\
+        #             1.8584, 1.8584, 1.8584, 1.5584, 1.8584, 1.8584, 1.8584\
+        #         ])).to(self.device)
+        self.theta_min = torch.tensor([limit[0] for limit in self.joints_limits]).to(self.device)
+        self.theta_max = torch.tensor([limit[1] for limit in self.joints_limits]).to(self.device)
         self.theta_mid = (self.theta_min + self.theta_max) / 2.0
         self.theta_min_soft = (self.theta_min-self.theta_mid)*0.8 + self.theta_mid
         self.theta_max_soft = (self.theta_max-self.theta_mid)*0.8 + self.theta_mid
@@ -137,26 +124,16 @@ class RobotLayer(torch.nn.Module):
     #     return normals
     def get_link_transformations(self,base_pose, theta):
         # theta: (B, dof)
+        # base_pose: (B, 4, 4)
         B = theta.shape[0]
-        idx = 0
         transformation = torch.tensor([]).to(self.device)
         for ee_link in self.ee_links:
-            # if self.robot == 'panda' and ee_link == 'panda_hand':#TODO 似乎panda也没有设置最后一个关节
-            #     # panda的最后一个关节是固定的，角度为-np.pi/4, 故在theta后增加
-            #     print('panda_hand has fixed joint -np.pi/4')
-            #     theta = torch.cat([theta, -np.pi/4*torch.ones_like(theta[:,0:1])], dim=1)
-            # print(f'Computing transformations for {ee_link}')
-            temp_trans = self.chain[ee_link].forward_kinematics(theta[:,idx:idx+self.DoFs[ee_link]],end_only=False)
-            temp_trans = torch.stack([temp_trans[k].get_matrix() for k in temp_trans.keys()],dim=0)
-            temp_trans = torch.matmul(base_pose.unsqueeze(0), temp_trans)
-            transformation = torch.cat((transformation,temp_trans),dim=0)
-            idx += self.DoFs[ee_link]
-        # for ee_link in self.ee_links:
-        #     for k in transformations[ee_link].keys():
-        #         matrix = transformations[ee_link][k].get_matrix()
-        #         transformations[ee_link][k] = torch.matmul(base_pose, matrix)
-        # print(f'Final transformation shape: {transformation.shape}')
-        # transformation: (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)
+            serial_theta = [theta[:,self.Joint2Idx[joint]] for joint in self.chain[ee_link].get_joint_parameter_names()]
+            serial_theta = torch.stack(serial_theta,dim=-1) # serial_theta: (B, Nl)
+            temp_trans = self.chain[ee_link].forward_kinematics(serial_theta,end_only=False)
+            temp_trans = torch.stack([temp_trans[k].get_matrix() for k in temp_trans.keys()],dim=0)# temp_trans: (Nl, B, 4, 4)
+            temp_trans = torch.matmul(base_pose.unsqueeze(0), temp_trans) # temp_trans: (Nl, B, 4, 4)
+            transformation = torch.cat((transformation,temp_trans),dim=0) # transformation: (sum(Nl), B, 4, 4)
         return transformation
     def load_meshes(self):
         check_normal = False
@@ -164,7 +141,7 @@ class RobotLayer(torch.nn.Module):
         mesh_files = glob.glob(self.mesh_path)
         mesh_files = [f for f in mesh_files if os.path.isfile(f)]
         meshes = {}
-
+        scale = self.parse_scale(self.paths['urdf'])
         for mesh_file in mesh_files:
             if 'panda_' in os.path.basename(mesh_file):
                 name = os.path.basename(mesh_file).split('panda_')[-1][:-4]
@@ -175,44 +152,122 @@ class RobotLayer(torch.nn.Module):
             mesh = trimesh.load(mesh_file)
             # print(f'Loading mesh for {name}')
             temp = torch.ones(mesh.vertices.shape[0], 1).float()
+            if name in scale.keys():
+                mesh.vertices *= scale[name]
             meshes[name] = [
                 torch.cat((torch.FloatTensor(np.array(mesh.vertices)), temp), dim=-1).to(self.device),
                 mesh.faces,
                 torch.cat((torch.FloatTensor(np.array(mesh.vertex_normals)), temp), dim=-1).to(self.device).to(torch.float)
                 ]
         return meshes
-
+    def parse_scale(self, urdf_path):
+        tree = ET.parse(urdf_path)
+        root = tree.getroot()
+        self.scale = {}
+        for link in root.findall('link'):
+            link_name = link.attrib['name']
+            visual = link.find('visual')
+            if visual is not None:
+                geometry = visual.find('geometry')
+                if geometry is not None:
+                    mesh = geometry.find('mesh')
+                    if mesh is not None and 'scale' in mesh.attrib:
+                        scale_values = mesh.attrib['scale'].split()
+                        self.scale[link_name] = [float(value) for value in scale_values]
+                    else:
+                        self.scale[link_name] = [1.0, 1.0, 1.0]
+            else:
+                self.scale[link_name] = [1.0, 1.0, 1.0]
+        return self.scale
+    def parse_link2mesh(self, urdf_path):
+        tree = ET.parse(urdf_path)
+        root = tree.getroot()
+        self.Link2Mesh = {}
+        for link in root.findall('link'):
+            link_name = link.attrib['name']
+            mesh_name = None
+            visual = link.find('visual')
+            if visual is not None:
+                geometry = visual.find('geometry')
+                if geometry is not None:
+                    mesh = geometry.find('mesh')
+                    if mesh is not None and 'filename' in mesh.attrib:
+                        mesh_file = mesh.attrib['filename']
+                        # 只保留文件名，不含路径和扩展名
+                        mesh_name = os.path.splitext(os.path.basename(mesh_file))[0]
+            self.Link2Mesh[link_name] = mesh_name
+        return self.Link2Mesh
+    def parse_urdf_origins(self, urdf_path):
+        tree = ET.parse(urdf_path)
+        root = tree.getroot()
+        self.LinkMeshTrans = {}
+        for link in root.findall('link'):
+            name = link.attrib['name']
+            origin_elem = None
+            # 优先visual的origin
+            visual = link.find('visual')
+            if visual is not None:
+                origin_elem = visual.find('origin')
+            # 其次collision的origin
+            if origin_elem is None:
+                collision = link.find('collision')
+                if collision is not None:
+                    origin_elem = collision.find('origin')
+            # 默认无变换
+            xyz = [0, 0, 0]
+            rpy = [0, 0, 0]
+            if origin_elem is not None:
+                xyz = [float(x) for x in origin_elem.attrib.get('xyz', '0 0 0').split()]
+                rpy = [float(r) for r in origin_elem.attrib.get('rpy', '0 0 0').split()]
+            # 欧拉角转旋转矩阵
+            rot_mat = torch.from_numpy(utils.euler_to_matrix(np.array(rpy)))
+            xyz_mat = torch.tensor(xyz).view(3, 1)
+            # rot_mat xyz_mat 变成 4x4
+            rot_mat = torch.cat((rot_mat, torch.zeros(1, 3)), dim=0)
+            rot_mat = torch.cat((rot_mat, torch.tensor([[0], [0], [0], [1]])), dim=1)
+            xyz_mat = torch.cat((xyz_mat, torch.tensor([[0]])), dim=0)
+            xyz_mat = torch.cat((torch.zeros(4,3), xyz_mat), dim=1)
+            trans_mat = rot_mat + xyz_mat
+            self.LinkMeshTrans[name] = trans_mat.to(self.device).float()
+        return self.LinkMeshTrans
+    def get_link_mesh_transformations(self, base_pose, theta):
+        # theta: (B, dof)
+        # base_pose: (B, 4, 4)
+        batch_size = theta.shape[0]
+        trans = self.get_link_transformations(base_pose, theta)
+        trans_idx = 0
+        trans_full = torch.zeros_like(trans)
+        for ee_link in self.ee_links:
+            links = self.chain[ee_link].get_link_names()
+            for i in range(len(links)):
+                link = links[i]
+                if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
+                    trans_full[trans_idx] = torch.matmul(trans[trans_idx,:,:,:], self.LinkMeshTrans[link].to(self.device).unsqueeze(0).expand(batch_size,4,4))          
+                trans_idx += 1
+        return trans_full
     def forward(self, pose, theta):
         batch_size = theta.shape[0]
-        # print('batch size', batch_size)
-        current_pose = pose.view(batch_size, 4, 4)
         vertices ={k: v[0].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 4)}
         normals = {k: v[-1].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 3)}
         trans = self.get_link_transformations(pose, theta)
-        # print(trans.shape)
-        # trans : (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)
-        # print(trans)
-        
-        c=input()
+        # trans : (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)        
         # the keys of vertices and normals are the same, and are mesh names(instead of link names)
-
         transformed_vertices = {}
         transformed_normals = {}
-        for i, link in enumerate(self.all_links):
-            if self.Link2Mesh[link] in vertices.keys():
-                link_idx = self.all_links.index(link)
-                mesh_name = self.Link2Mesh[link]
-                # transformed_vertices[link] = torch.matmul(vertices[mesh_name],trans[link_idx,:,:3,:3])#TODO why transpose?
-                # transformed_normals[link] = torch.matmul(normals[mesh_name],trans[link_idx,:,:3,:3])
-                transformed_vertices[link] = torch.matmul(trans[link_idx,:,:,:], vertices[mesh_name].transpose(2, 1)).transpose(1, 2)
-                # print(f'transformed_vertices[link].shape{transformed_vertices[link].shape}')
-                transformed_vertices[link] = transformed_vertices[link][:, :, :3]  # remove the homogeneous coordinate
-                transformed_normals[link] = torch.matmul(trans[link_idx,:,:,:], normals[mesh_name].transpose(2, 1)).transpose(1, 2)
-                transformed_normals[link] = transformed_normals[link][:, :, :3]
-                # print(f'link: {link}, vertices shape: {transformed_vertices[link].shape}, normals shape: {transformed_normals[link].shape}')
-            # vertices[link] = torch.matmul(vertices[link],trans[link_idx,:,:3,:3].transpose(2,
         # transeformed_vertices : (link, (B, Nv, 3))
         # transeformed_normals : (link, (B, Nv, 3))
+        trans_idx = 0
+        for ee_link in self.ee_links:
+            links = self.chain[ee_link].get_link_names()
+            for i in range(len(links)):
+                link = links[i]
+                if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
+                    trans_full = torch.matmul(trans[trans_idx,:,:,:], self.LinkMeshTrans[link].to(self.device).unsqueeze(0).expand(batch_size,4,4))
+                    transformed_vertices[link] = torch.matmul(trans_full, vertices[self.Link2Mesh[links[i]]].transpose(2, 1)).transpose(1, 2)
+                    transformed_vertices[link] = transformed_vertices[link][:, :, :3]  # remove the homogeneous coordinate
+                    transformed_normals[link] = torch.matmul(trans_full, normals[self.Link2Mesh[links[i]]].transpose(2, 1)).transpose(1, 2)
+                    transformed_normals[link] = transformed_normals[link][:, :, :3]                
+                trans_idx += 1
         return transformed_vertices, transformed_normals
 
     def get_eef(self,pose, theta,link=-1):

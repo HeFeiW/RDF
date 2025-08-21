@@ -26,12 +26,11 @@ if args.robot == 'panda':
 elif args.robot == 'leaphand':
     mesh_path = os.path.join(CUR_PATH, 'descriptions/leaphand/meshes/*.stl')
 elif args.robot == 'dexhand':
-    mesh_path = os.path.join(CUR_PATH, 'descriptions/dexhand/right/*.stl')
+    mesh_path = os.path.join(CUR_PATH, 'descriptions/dexhand/meshes/*.stl')
    
     
 mesh_files = glob.glob(mesh_path)
-mesh_files = sorted(mesh_files)[:] #except finger
-
+mesh_files = sorted(mesh_files)[:]
 for mf in mesh_files:
     # 先检查一下，如果已经存在数据，就跳过
     save_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),f'data/{args.robot}/sdf_points')

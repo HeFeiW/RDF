@@ -113,7 +113,8 @@ def plot_3D_panda_with_gradient(pose,theta,bp_sdf,model,device):
     sdf,ana_grad = bp_sdf.get_whole_body_sdf_batch(points,pose,theta,model,use_derivative=True)
     sdf,ana_grad = sdf.squeeze().detach().cpu().numpy(),ana_grad.squeeze().detach().cpu().numpy()
     # 在的空间中画一个0.1*0.1*0.1的立方体
-    scene.add_geometry(trimesh.creation.box(extents=[0.1,0.1,0.1],transform=trimesh.transformations.translation_matrix([0,0,0.05]),color=[0,255,0,100]))
+    scene.add_geometry(trimesh.creation.box(extents=[100,100,100],transform=trimesh.transformations.translation_matrix([0,0,0.05]),color=[255,0,0,100]))
+    print('here is the cube')
     for i in range(len(points)):
         dg = ana_grad[i]
         if dg.sum() ==0:
@@ -191,6 +192,27 @@ def vis_panda_sdf(pose, theta,device):
     pc =trimesh.PointCloud(pts,colors = [255,0,0])
     scene.add_geometry(pc)
     scene.show()
+def plot_sdf_shell(robot,bp_sdf,pose,theta,model,device,distance=0.0):
+    space_limits = robot.space_limits.cpu().numpy()
+    N = 100000
+    points = np.random.rand(N,3) * (space_limits[1]-space_limits[0]) + space_limits[0]
+    points = torch.from_numpy(points).float().to(device)
+    sdf,_ = bp_sdf.get_whole_body_sdf_batch(points,pose,theta,model,use_derivative=False)
+    sdf = sdf.squeeze().detach().cpu().numpy()
+    th = (space_limits.max() - space_limits.min()).mean() / 50.0
+    print(th)
+    choice = ((sdf-distance)<th) * ((sdf-distance)>-th)
+    points = points[choice]
+    sdf = sdf[choice]
+    print(points.shape,sdf.shape)
+
+    scene = trimesh.Scene()
+    robot_mesh = robot.get_forward_robot_mesh(pose, theta)[0]
+    robot_mesh = np.sum(robot_mesh)
+    scene.add_geometry(robot_mesh)
+    pc =trimesh.PointCloud(points.detach().cpu().numpy(),colors = [255,0,0,150])
+    scene.add_geometry(pc)
+    scene.show()
 
 if __name__ =='__main__':
 
@@ -209,19 +231,21 @@ if __name__ =='__main__':
         'points': os.path.join(CUR_DIR,f'data/{args.robot}/sdf_points/'),
         'model':os.path.join(CUR_DIR, f'models/{args.robot}/BP_{args.n_func}.pt')
         }
-    robot = RobotLayer(device=args.device,paths=paths,robot='panda')
+    robot = RobotLayer(device=args.device,paths=paths,robot=args.robot)
     bp_sdf = bf_sdf.BPSDF(args.n_func,args.domain_min,args.domain_max,robot,paths,args.device)
 
     #  load  model
-    model = torch.load(f'models/{args.robot}//BP_{args.n_func}.pt')
-
-    # initial the robot configuration
-    # theta = torch.tensor([0, -0.3, 0, -2.2, 0, 2.0, 0]).float().to(args.device).reshape(-1,7)
-    theta = torch.zeros([1,7]).float().to(args.device).reshape(-1,7)
+    model = torch.load(f'models/{args.robot}/BP_{args.n_func}.pt')
+    
+    # --- initialize theta ---
+    device = args.device
+    theta = torch.randn([1,robot.dof]).to(device) * (robot.theta_max_soft - robot.theta_min_soft) + robot.theta_min_soft
+    # theta = torch.zeros([1,robot.dof]).to(device)
+    theta = theta.to(args.device).reshape(-1,robot.dof)
     pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(len(theta),4,4).float()
-
     # # vis 2D SDF with gradient
     # plot_2D_panda_sdf(pose,theta,bp_sdf,nbData=80,model=model,device=args.device)
 
     # vis 3D SDF with gradient
-    plot_3D_panda_with_gradient(pose,theta,bp_sdf,model=model,device=args.device)
+    # plot_3D_panda_with_gradient(pose,theta,bp_sdf,model=model,device=args.device)
+    plot_sdf_shell(robot,bp_sdf,pose,theta,model,device=args.device)

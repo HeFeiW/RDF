@@ -3,3 +3,8 @@ panda_layer/__pycache__
 joint_conf.pt
 data/sdf_points/voxel*
 /output_meshes
+mesh_to_sdf/
+*.npy
+*.pt
+*.stl
+*.obj

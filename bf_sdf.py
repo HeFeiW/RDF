@@ -72,22 +72,19 @@ class BPSDF():
 
     def train_bf_sdf(self,epoches=200,mesh_path=None,point_path=None):
         # represent SDF using basis functions
-        mesh_path = self.paths['meshes']
-        mesh_files = glob.glob(mesh_path)
-        mesh_files = sorted(mesh_files)[:]
         mesh_dict = {}
-        for i,mf in enumerate(mesh_files):
-            mesh_name = mf.split('/')[-1].split('.')[0]
-            if '_vis' in mesh_name:
-                mesh_name = mesh_name.replace('_vis','')
-            mesh = trimesh.load(mf)
+        for mesh_name in self.robot.Link2Mesh.values():
+            if mesh_name is None:
+                continue
+            mesh = trimesh.Trimesh(self.robot.meshes[mesh_name][0][:,:3].cpu().detach().numpy(),
+                                   self.robot.meshes[mesh_name][1])
             offset = mesh.bounding_box.centroid
             scale = np.max(np.linalg.norm(mesh.vertices-offset, axis=1))
             mesh = mesh_to_sdf.scale_to_unit_sphere(mesh)
             mesh_dict[mesh_name] = {}
             mesh_dict[mesh_name]['mesh_name'] = mesh_name
             # load data
-            point_path = os.path.join(self.paths['points'],f'voxel_128_{mesh_name}.npy')
+            point_path = self.paths['points'] + f'voxel_128_{mesh_name}.npy'
             
             data = np.load(point_path,allow_pickle=True).item()#TODO
             point_near_data = data['near_points']
@@ -163,6 +160,7 @@ class BPSDF():
         for verts, faces,mesh_name in zip(verts_list, faces_list,mesh_name_list):
             rec_mesh = trimesh.Trimesh(verts,faces)
             if vis:
+                print(f'visualizing {mesh_name} mesh')
                 rec_mesh.show()
             if save_mesh_name != None:
                 save_path = os.path.join(CUR_DIR,"output_meshes")
@@ -182,38 +180,42 @@ class BPSDF():
         B = len(theta)
         N = len(x)
         K = len(used_links)
+        
         # print(f'Batch size: {B}, Number of links: {K}, Number of points: {N}')
         # print(f'Used links: {used_links}')
         # print(f'model keys: {model.keys()}')
         offset = torch.cat([model[self.robot.Link2Mesh[link]]['offset'].unsqueeze(0) for link in used_links],dim=0).to(self.device)
-        offset = offset.unsqueeze(0).expand(B,K,3).reshape(B*K,3).float()
+        offset = offset.unsqueeze(0).expand(B,K,3).reshape(B*K,3).float()# offset: (B*K,3)
+        
         scale = torch.tensor([model[self.robot.Link2Mesh[link]]['scale'] for link in used_links],device=self.device)
-        scale = scale.unsqueeze(0).expand(B,K).reshape(B*K).float()
-        trans = self.robot.get_link_transformations(pose, theta)
+        scale = scale.unsqueeze(0).expand(B,K).reshape(B*K).float()# scale: (B*K)
+        trans = self.robot.get_link_mesh_transformations(pose, theta)#trans: (K+1, B, 4, 4)
         used_indices = [self.robot.all_links.index(link) for link in used_links if link in self.robot.all_links]
-        # print(f'used_indices: {used_indices}')
-        trans = trans[used_indices]  # (K, B, 4, 4)
-        # print(f'trans shape after gather:{trans.shape}')
-        trans = trans.reshape(-1,4,4).float()
+        trans = trans[used_indices]  # trans: (K, B, 4, 4)
+        trans = trans.transpose(1,0) # (B, K, 4, 4)
+        trans = trans.reshape(-1,4,4).float() # trans: (B*K, 4, 4)
         x_robot_frame_batch = utils.transform_points(x.float(),torch.linalg.inv(trans).float(),device=self.device) # B*K,N,3
+        # x_robot_frame_batch: (B*K,N,3); x: （N,3）
         x_robot_frame_batch_scaled = x_robot_frame_batch - offset.unsqueeze(1)
         x_robot_frame_batch_scaled = x_robot_frame_batch_scaled/scale.unsqueeze(-1).unsqueeze(-1) #B*K,N,3
 
         x_bounded = torch.where(x_robot_frame_batch_scaled>1.0-1e-2,1.0-1e-2,x_robot_frame_batch_scaled)
         x_bounded = torch.where(x_bounded<-1.0+1e-2,-1.0+1e-2,x_bounded)
-        res_x = x_robot_frame_batch_scaled - x_bounded
-
+        res_x = x_robot_frame_batch_scaled - x_bounded # res_x: B*K,N,3
+        
         if not use_derivative:
             phi,_ = self.build_basis_function_from_points(x_bounded.reshape(B*K*N,3), use_derivative=False)
             phi = phi.reshape(B,K,N,-1).transpose(0,1).reshape(K,B*N,-1) # K,B*N,-1
             weights_near = torch.cat([model[self.robot.Link2Mesh[link]]['weights'].unsqueeze(0) for link in used_links],dim=0).to(self.device)
             # sdf
-            sdf = torch.einsum('ijk,ik->ij',phi,weights_near).reshape(K,B,N).transpose(0,1).reshape(B*K,N) # B,K,N
+            sdf = torch.einsum('ijk,ik->ij',phi,weights_near).reshape(K,B,N).transpose(0,1).reshape(B*K,N) # B*K,N
+            # np.set_printoptions(threshold=np.inf)
+            # print(sdf.reshape(B,K,N).transpose(0,1)[0].cpu().detach().numpy())
             sdf = sdf + res_x.norm(dim=-1)
             sdf = sdf.reshape(B,K,N)
-            sdf = sdf*scale.reshape(B,K).unsqueeze(-1)
+            sdf = sdf*scale.reshape(B,K).unsqueeze(-1)#sdf  (B,K,1)
+
             sdf_value, idx = sdf.min(dim=1)
-            print(f'sdf_values:{sdf_value}, idx:{idx}')
             if return_index:
                 return sdf_value, None, idx
             return sdf_value, None
@@ -232,7 +234,7 @@ class BPSDF():
             sdf = sdf.reshape(B,K,N)
             sdf = sdf*(scale.reshape(B,K).unsqueeze(-1))
             sdf_value, idx = sdf.min(dim=1)
-            print(f'sdf_values:{sdf_value}, idx:{idx}')
+            # print(f'sdf_values:{sdf_value}, idx:{idx}')
             # derivative
             gradient = res_x + torch.nn.functional.normalize(gradient,dim=-1)
             gradient = torch.nn.functional.normalize(gradient,dim=-1).float()
@@ -328,15 +330,10 @@ if __name__ =='__main__':
         # trans_list = robot.get_transformations_each_link(pose,theta)
         # print(trans_list)
         
-        # print('------------------------------------------------------------')
-        trans_list = robot.get_link_transformations(pose, theta)
-        # print(trans_list)
-        
         # run RDF 
         x = torch.rand(128,3).to(args.device)*2.0 - 1.0
         pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(B,4,4).float()
         used_link = robot.all_links
-        # print('used link:',used_link)
         sdf,gradient = bp_sdf.get_whole_body_sdf_batch(x,pose,theta,model,use_derivative=True,used_links = used_link)
         print('sdf:',sdf,'gradient:',gradient)
         sdf,joint_grad = bp_sdf.get_whole_body_sdf_with_joints_grad_batch(x,pose,theta,model,used_links= used_link)

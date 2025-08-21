@@ -139,3 +139,15 @@ def create_arrow(vector,point,vec_length = 0.05,color =[255,0,0]):
     arrow.apply_transform(transformation)
     arrow.visual.face_colors = np.array(color,dtype=object)
     return arrow
+
+def euler_to_matrix(rpy):
+    matrix_x = np.array([[1, 0, 0],
+                         [0, np.cos(rpy[0]), -np.sin(rpy[0])],
+                         [0, np.sin(rpy[0]), np.cos(rpy[0])]])
+    matrix_y = np.array([[np.cos(rpy[1]), 0, np.sin(rpy[1])],
+                         [0, 1, 0],
+                         [-np.sin(rpy[1]), 0, np.cos(rpy[1])]])
+    matrix_z = np.array([[np.cos(rpy[2]), -np.sin(rpy[2]), 0],
+                         [np.sin(rpy[2]), np.cos(rpy[2]), 0],
+                         [0, 0, 1]])
+    return matrix_z @ matrix_y @ matrix_x
