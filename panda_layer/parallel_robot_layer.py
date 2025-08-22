@@ -28,6 +28,7 @@ import xml.etree.ElementTree as ET
 import math
 import argparse
 import utils
+from serial_robot_layer import SerialRobotLayer
 
 def save_to_mesh(vertices, faces, output_mesh_path=None):
     assert output_mesh_path is not None
@@ -39,7 +40,7 @@ def save_to_mesh(vertices, faces, output_mesh_path=None):
     print('Output mesh save to: ', os.path.abspath(output_mesh_path))
 
 
-class RobotLayer(torch.nn.Module):
+class ParallelRobotLayer(torch.nn.Module):
     def __init__(self, device,paths,robot='panda'):
         # The forward kinematics equations implemented here are     robot_mesh.show()from
         super().__init__()
@@ -64,24 +65,28 @@ class RobotLayer(torch.nn.Module):
         elif robot == 'leaphand':
             self.ee_links = ['fingertip','fingertip_2','fingertip_3','thumb_fingertip']
             self.space_limits = torch.tensor([[-0.3,-0.3,-0.15],[0.1,0.1,0.2]])
-        self.chain = {}
-        self.all_links = []
-        for ee_link in self.ee_links:
-            self.chain[ee_link] = pk.build_serial_chain_from_urdf(open(self.paths['urdf']).read().encode(),ee_link).to(dtype=torch.float32, device=self.device)
-            self.all_links += self.chain[ee_link].get_link_names()
-
+            
         # --- initialize meshes ---
         self.meshes = self.load_meshes()
         self.LinkMeshTrans = self.parse_urdf_origins(self.paths['urdf'])
         self.Link2Mesh = self.parse_link2mesh(self.paths['urdf'])
         
-        # --- initialize joints ---
-        joints_info_dict = {}
+       
+        self.serials = []
         for ee_link in self.ee_links:
-            low, high = self.chain[ee_link].get_joint_limits()
-            joints = self.chain[ee_link].get_joint_parameter_names()
-            for i in range(len(joints)):
-                joints_info_dict[joints[i]] = [low[i], high[i]]
+            chain = pk.build_serial_chain_from_urdf(open(self.paths['urdf']).read().encode(),ee_link).to(dtype=torch.float32, device=self.device)
+            self.serials.append(SerialRobotLayer(chain=chain,
+                                                 meshes=self.meshes,
+                                                 Link2Mesh=self.Link2Mesh,
+                                                 LinkMeshTrans=self.LinkMeshTrans,
+                                                 scale=self.scale,
+                                                 device=self.device
+                                                ))
+        # --- initialize joints ---
+        self.chain = pk.build_chain_from_urdf(open(self.paths['urdf']).read().encode()).to(dtype=torch.float32, device=self.device)
+        joints_info_dict = {}
+        for serial in self.serials:
+            joints_info_dict.update(serial.joint_limits)
         self.dof = len(joints_info_dict)
         self.joint_limits = {joint: joints_info_dict[joint] for joint in joints_info_dict.keys()}
         self.Joint2Idx = {joint: idx for idx, joint in enumerate(joints_info_dict.keys())}
@@ -94,19 +99,6 @@ class RobotLayer(torch.nn.Module):
         self.theta_max_soft = (self.theta_max-self.theta_mid)*0.8 + self.theta_mid
         self.dof = len(self.theta_min)
 
-    def get_link_transformations(self,base_pose, theta):
-        # theta: (B, dof)
-        # base_pose: (B, 4, 4)
-        B = theta.shape[0]
-        transformation = torch.tensor([]).to(self.device)
-        for ee_link in self.ee_links:
-            serial_theta = [theta[:,self.Joint2Idx[joint]] for joint in self.chain[ee_link].get_joint_parameter_names()]
-            serial_theta = torch.stack(serial_theta,dim=-1) # serial_theta: (B, Nl)
-            temp_trans = self.chain[ee_link].forward_kinematics(serial_theta,end_only=False)
-            temp_trans = torch.stack([temp_trans[k].get_matrix() for k in temp_trans.keys()],dim=0)# temp_trans: (Nl, B, 4, 4)
-            temp_trans = torch.matmul(base_pose.unsqueeze(0), temp_trans) # temp_trans: (Nl, B, 4, 4)
-            transformation = torch.cat((transformation,temp_trans),dim=0) # transformation: (sum(Nl), B, 4, 4)
-        return transformation
     def load_meshes(self):
         check_normal = False
         # mesh_path = os.path.dirname(os.path.realpath(__file__)) + "/meshes/visual/*.stl"
@@ -155,8 +147,10 @@ class RobotLayer(torch.nn.Module):
         tree = ET.parse(urdf_path)
         root = tree.getroot()
         Link2Mesh = {}
+        self.all_links = []
         for link in root.findall('link'):
             link_name = link.attrib['name']
+            self.all_links.append(link_name)
             mesh_name = None
             visual = link.find('visual')
             if visual is not None:
@@ -205,41 +199,32 @@ class RobotLayer(torch.nn.Module):
     def get_link_mesh_transformations(self, base_pose, theta):
         # theta: (B, dof)
         # base_pose: (B, 4, 4)
-        batch_size = theta.shape[0]
-        trans = self.get_link_transformations(base_pose, theta)
-        trans_idx = 0
-        trans_full = torch.zeros_like(trans)
-        for ee_link in self.ee_links:
-            links = self.chain[ee_link].get_link_names()
-            for i in range(len(links)):
-                link = links[i]
+        trans = {}
+        for serial in self.serials:
+            serial_theta = torch.stack([theta[:,serial.Joint2Idx[joint]] for joint in serial.Joint2Idx.keys()],dim=-1)
+            serial_trans = serial.get_link_mesh_transformations(base_pose, serial_theta)
+            for link in serial.all_links:
                 if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
-                    trans_full[trans_idx] = torch.matmul(trans[trans_idx,:,:,:], self.LinkMeshTrans[link].to(self.device).unsqueeze(0).expand(batch_size,4,4))          
-                trans_idx += 1
-        return trans_full
+                    trans[link] = serial_trans[link]
+        print(len(trans))
+        return trans
     def forward(self, pose, theta):
         batch_size = theta.shape[0]
         vertices ={k: v[0].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 4)}
         normals = {k: v[-1].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 3)}
-        trans = self.get_link_transformations(pose, theta)
+        trans = self.get_link_mesh_transformations(pose, theta)
         # trans : (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)        
         # the keys of vertices and normals are the same, and are mesh names(instead of link names)
         transformed_vertices = {}
         transformed_normals = {}
         # transeformed_vertices : (link, (B, Nv, 3))
         # transeformed_normals : (link, (B, Nv, 3))
-        trans_idx = 0
-        for ee_link in self.ee_links:
-            links = self.chain[ee_link].get_link_names()
-            for i in range(len(links)):
-                link = links[i]
-                if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
-                    trans_full = torch.matmul(trans[trans_idx,:,:,:], self.LinkMeshTrans[link].to(self.device).unsqueeze(0).expand(batch_size,4,4))
-                    transformed_vertices[link] = torch.matmul(trans_full, vertices[self.Link2Mesh[links[i]]].transpose(2, 1)).transpose(1, 2)
-                    transformed_vertices[link] = transformed_vertices[link][:, :, :3]  # remove the homogeneous coordinate
-                    transformed_normals[link] = torch.matmul(trans_full, normals[self.Link2Mesh[links[i]]].transpose(2, 1)).transpose(1, 2)
-                    transformed_normals[link] = transformed_normals[link][:, :, :3]                
-                trans_idx += 1
+        for link in self.all_links:
+            if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
+                transformed_vertices[link] = torch.matmul(trans[link], vertices[self.Link2Mesh[link]].transpose(2, 1)).transpose(1, 2)
+                transformed_vertices[link] = transformed_vertices[link][:, :, :3]  # remove the homogeneous coordinate
+                transformed_normals[link] = torch.matmul(trans[link], normals[self.Link2Mesh[link]].transpose(2, 1)).transpose(1, 2)
+                transformed_normals[link] = transformed_normals[link][:, :, :3]        
         return transformed_vertices, transformed_normals
 
     def get_robot_mesh(self, vertices_list, faces):
@@ -249,8 +234,7 @@ class RobotLayer(torch.nn.Module):
         return meshes
 
     def get_forward_robot_mesh(self, pose, theta):
-        batch_size = pose.size()[0]
-        vertices, normals = self.forward(pose, theta)
+        vertices, _ = self.forward(pose, theta)
         # vertices : (link, (B, Nv, 3))
         # normals : (link, (B, Nv, 3))
         # print(f'vertices keys: {vertices.keys()}')
@@ -281,9 +265,14 @@ if __name__ == "__main__":
         'urdf': f'../descriptions/{args.robot}/*.urdf',
         'meshes': f'../descriptions/{args.robot}/meshes/*.stl'
     }
-    panda = RobotLayer(device,paths=paths,robot=args.robot).to(device)
-    # scene = trimesh.Scene()
-
+    robot = ParallelRobotLayer(device,paths=paths,robot=args.robot).to(device)
+    scene = trimesh.Scene()
+    mesh = robot.get_forward_robot_mesh(
+        torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).expand(1,-1,-1).float(),
+        torch.zeros(1,robot.dof).float().to(device)
+    )[0]
+    scene.add_geometry(mesh)
+    scene.show()
     # # show robot
     # # theta = panda.theta_min + (panda.theta_max-panda.theta_min)*0.5
     # # theta = torch.tensor([0, 0.8, -0.0, -2.3, -2.8, 1.5, np.pi/4.0]).float().to(device).reshape(-1,7)
