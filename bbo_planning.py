@@ -9,7 +9,7 @@ import torch
 import trimesh
 import numpy as np
 import math
-from panda_layer.panda_layer import PandaLayer
+from RDF.panda_layer.panda_layer_ import PandaLayer
 import bf_sdf
 
 class BBOPlanner():

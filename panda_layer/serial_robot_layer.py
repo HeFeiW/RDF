@@ -1,11 +1,15 @@
-from robot_layer import RobotLayer
+import sys
+import os
+CUR_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(CUR_DIR,'..'))
+
+from panda_layer.robot_layer import RobotLayer
 import argparse
 import numpy as np
-import os
 import torch
 import trimesh
 class SerialRobotLayer(torch.nn.Module):
-    def __init__(self,chain,meshes,Link2Mesh,LinkMeshTrans,scale,device):
+    def __init__(self,chain,meshes,Link2Mesh,LinkMeshTrans,scale,device,space_limits = None):
         self.device = device
         self.chain = chain
         self.all_links = self.chain.get_link_names()
@@ -23,6 +27,7 @@ class SerialRobotLayer(torch.nn.Module):
         self.theta_min_soft = (self.theta_min-self.theta_mid)*0.8 + self.theta_mid
         self.theta_max_soft = (self.theta_max-self.theta_mid)*0.8 + self.theta_mid
         self.meshes = {Link2Mesh[link]: meshes[Link2Mesh[link]] for link in self.all_links if Link2Mesh[link] is not None}
+        self.space_limits = space_limits
 
     def get_link_transformations(self,base_pose, theta):
         # theta: (B, dof)
@@ -49,36 +54,35 @@ class SerialRobotLayer(torch.nn.Module):
         batch_size = theta.shape[0]
         vertices ={k: v[0].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 4)}
         normals = {k: v[-1].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 3)}
-        trans = self.get_link_transformations(pose, theta)
+        trans = self.get_link_mesh_transformations(pose, theta)
         # trans : (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)        
         # the keys of vertices and normals are the same, and are mesh names(instead of link names)
         transformed_vertices = {}
         transformed_normals = {}
         # transeformed_vertices : (link, (B, Nv, 3))
         # transeformed_normals : (link, (B, Nv, 3))
-        trans_idx = 0
         for link in self.all_links:
             if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
-                trans_full = torch.matmul(trans[trans_idx,:,:,:], self.LinkMeshTrans[link].to(self.device).unsqueeze(0).expand(batch_size,4,4))
-                transformed_vertices[link] = torch.matmul(trans_full, vertices[self.Link2Mesh[link]].transpose(2, 1)).transpose(1, 2)
+                transformed_vertices[link] = torch.matmul(trans[link], vertices[self.Link2Mesh[link]].transpose(2, 1)).transpose(1, 2)
                 transformed_vertices[link] = transformed_vertices[link][:, :, :3]  # remove the homogeneous coordinate
-                transformed_normals[link] = torch.matmul(trans_full, normals[self.Link2Mesh[link]].transpose(2, 1)).transpose(1, 2)
-                transformed_normals[link] = transformed_normals[link][:, :, :3]                
-            trans_idx += 1
+                transformed_normals[link] = torch.matmul(trans[link], normals[self.Link2Mesh[link]].transpose(2, 1)).transpose(1, 2)
+                transformed_normals[link] = transformed_normals[link][:, :, :3] 
         return transformed_vertices, transformed_normals
     def get_robot_mesh(self, vertices_list, faces):
         # vertices_list : {link, (Nv, 3)} # Nl=number of links that have meshes,
         # faces : (Nm) Nm=number of meshes
         meshes = [trimesh.Trimesh(vertices_list[link].detach().cpu().numpy(), faces[self.Link2Mesh[link]]) for link in vertices_list.keys()]
         return meshes
-    def get_forward_robot_mesh(self, pose, theta):
+    def get_forward_robot_mesh(self, pose, theta,used_links = None):
+        if used_links is None:
+            used_links = self.all_links
         vertices, _ = self.forward(pose, theta)
         # vertices : (link, (B, Nv, 3))
         # normals : (link, (B, Nv, 3))
         for k in vertices.keys():
             B = vertices[k].shape[0]
             break
-        temp_vertices_list = {link:vertices[link] for link in self.Link2Mesh.keys() if self.Link2Mesh[link] is not None}
+        temp_vertices_list = {link:vertices[link] for link in used_links if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None}
         # verices: (Nlm, B, Nv, 3)->(B, Nlm, Nv, 3) Nlm=number of links that have meshes,
         # if the robot have repeated links (because of multiple ee_links)
         # it will hit only once

@@ -23,12 +23,12 @@ CUR_DIR = os.path.dirname(os.path.realpath(__file__))
 import numpy as np
 import sys
 sys.path.append(os.path.join(CUR_DIR,'..'))
+from panda_layer.serial_robot_layer import SerialRobotLayer
 import pytorch_kinematics as pk
 import xml.etree.ElementTree as ET
 import math
 import argparse
 import utils
-from serial_robot_layer import SerialRobotLayer
 
 def save_to_mesh(vertices, faces, output_mesh_path=None):
     assert output_mesh_path is not None
@@ -61,10 +61,11 @@ class ParallelRobotLayer(torch.nn.Module):
             self.space_limits = torch.tensor([[-0.5,-0.5,0],[0.5,0.5,1.0]])
         elif robot == 'dexhand':
             self.ee_links = ['ring_tip_1','pinky_tip_1','middle_tip_1','index_tip_1','thumb_tip_1','hand-cover_1']
-            self.space_limits = torch.tensor([[-0.3,-0.2,0.2],[0.3,0.2,0.4]])
+            
         elif robot == 'leaphand':
             self.ee_links = ['fingertip','fingertip_2','fingertip_3','thumb_fingertip']
-            self.space_limits = torch.tensor([[-0.3,-0.3,-0.15],[0.1,0.1,0.2]])
+            self.space_limits = torch.tensor([[-0.2,-0.2,-0.1],[0.06,0.02,0.1]])
+            
             
         # --- initialize meshes ---
         self.meshes = self.load_meshes()
@@ -80,7 +81,8 @@ class ParallelRobotLayer(torch.nn.Module):
                                                  Link2Mesh=self.Link2Mesh,
                                                  LinkMeshTrans=self.LinkMeshTrans,
                                                  scale=self.scale,
-                                                 device=self.device
+                                                 device=self.device,
+                                                 space_limits=self.space_limits
                                                 ))
         # --- initialize joints ---
         self.chain = pk.build_chain_from_urdf(open(self.paths['urdf']).read().encode()).to(dtype=torch.float32, device=self.device)
@@ -88,12 +90,13 @@ class ParallelRobotLayer(torch.nn.Module):
         for serial in self.serials:
             joints_info_dict.update(serial.joint_limits)
         self.dof = len(joints_info_dict)
-        self.joint_limits = {joint: joints_info_dict[joint] for joint in joints_info_dict.keys()}
+        joint_limits_dict = {joint: joints_info_dict[joint] for joint in joints_info_dict.keys()}
         self.Joint2Idx = {joint: idx for idx, joint in enumerate(joints_info_dict.keys())}
+        self.joint_limits = torch.tensor([joint_limits_dict[joint] for joint in joints_info_dict.keys()]).to(self.device).transpose(1,0).float()
         
         # # --- initialize joint limits ---
-        self.theta_min = torch.tensor([limit[0] for limit in self.joint_limits.values()]).to(self.device)
-        self.theta_max = torch.tensor([limit[1] for limit in self.joint_limits.values()]).to(self.device)
+        self.theta_min = self.joint_limits[0]
+        self.theta_max = self.joint_limits[1]
         self.theta_mid = (self.theta_min + self.theta_max) / 2.0
         self.theta_min_soft = (self.theta_min-self.theta_mid)*0.8 + self.theta_mid
         self.theta_max_soft = (self.theta_max-self.theta_mid)*0.8 + self.theta_mid
@@ -201,18 +204,18 @@ class ParallelRobotLayer(torch.nn.Module):
         # base_pose: (B, 4, 4)
         trans = {}
         for serial in self.serials:
-            serial_theta = torch.stack([theta[:,serial.Joint2Idx[joint]] for joint in serial.Joint2Idx.keys()],dim=-1)
+            serial_theta = torch.stack([theta[:,self.Joint2Idx[joint]] for joint in serial.Joint2Idx.keys()],dim=-1)
             serial_trans = serial.get_link_mesh_transformations(base_pose, serial_theta)
             for link in serial.all_links:
                 if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None:
                     trans[link] = serial_trans[link]
-        print(len(trans))
         return trans
     def forward(self, pose, theta):
         batch_size = theta.shape[0]
         vertices ={k: v[0].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 4)}
         normals = {k: v[-1].repeat(batch_size, 1, 1) for k,v in self.meshes.items()}# {mesh_name,(B, Nv, 3)}
         trans = self.get_link_mesh_transformations(pose, theta)
+
         # trans : (Nl, B, 4, 4)) Nl=number of links(including those not in self.Link2Mesh)        
         # the keys of vertices and normals are the same, and are mesh names(instead of link names)
         transformed_vertices = {}
@@ -233,7 +236,11 @@ class ParallelRobotLayer(torch.nn.Module):
         meshes = [trimesh.Trimesh(vertices_list[link].detach().cpu().numpy(), faces[self.Link2Mesh[link]]) for link in vertices_list.keys()]
         return meshes
 
-    def get_forward_robot_mesh(self, pose, theta):
+    def get_forward_robot_mesh(self, pose, theta,used_links = None):
+        if used_links is None:
+            used_links = self.Link2Mesh.keys()
+        for used_link in used_links:
+            assert used_link in self.Link2Mesh.keys()
         vertices, _ = self.forward(pose, theta)
         # vertices : (link, (B, Nv, 3))
         # normals : (link, (B, Nv, 3))
@@ -242,14 +249,14 @@ class ParallelRobotLayer(torch.nn.Module):
         for k in vertices.keys():
             B = vertices[k].shape[0]
             break
-        temp_vertices_list = {link:vertices[link] for link in self.Link2Mesh.keys() if self.Link2Mesh[link] is not None}
+        temp_vertices_list = {link:vertices[link] for link in used_links if link in self.Link2Mesh.keys() and self.Link2Mesh[link] is not None}
         # verices: (Nlm, B, Nv, 3)->(B, Nlm, Nv, 3) Nlm=number of links that have meshes,
         # if the robot have repeated links (because of multiple ee_links)
         # it will hit only once
         vertices_list = [{k:temp_vertices_list[k][b] for k in temp_vertices_list.keys()} for b in range(B)]
         # print(f'vertices_list len: {len(vertices_list)}, vertices_list[0] len: {len(vertices_list[0])}')
         # vertices_list : (B, {link,(Nv, 3)}) there are Nlm links （the links that have meshes) 
-        robot_faces =  {link:self.meshes[link][1] for link in self.meshes.keys()} # (Nm) Nm=number of meshes
+        robot_faces =  {link:self.meshes[link][1] for link in self.meshes.keys() if link in used_links} # (Nm) Nm=number of meshes
         mesh = [self.get_robot_mesh(vertices, robot_faces) for vertices in vertices_list]
         # mesh: (B, Nl) Nl=number of links that have meshes, 
         # may have repeated links if the robot has multiple ee_links
@@ -266,13 +273,28 @@ if __name__ == "__main__":
         'meshes': f'../descriptions/{args.robot}/meshes/*.stl'
     }
     robot = ParallelRobotLayer(device,paths=paths,robot=args.robot).to(device)
-    scene = trimesh.Scene()
-    mesh = robot.get_forward_robot_mesh(
-        torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).expand(1,-1,-1).float(),
-        torch.zeros(1,robot.dof).float().to(device)
-    )[0]
-    scene.add_geometry(mesh)
-    scene.show()
+    theta = torch.zeros(1,robot.dof).float().to(device)
+    pose = torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).expand(len(theta),-1,-1).float()
+    trans = robot.get_link_mesh_transformations(pose, theta)
+    mcp=trans['mcp_joint']
+    mcp_2=trans['mcp_joint_2']
+    mcp_3=trans['mcp_joint_3']
+    print(mcp)
+    print(mcp_2)
+    print(mcp_3)
+    # 计算mcp_joint到mcp_joint_2的变换矩阵
+    mcp_to_mcp2 = torch.matmul(torch.inverse(mcp), mcp_2)
+    print('mcp_to_mcp2:',mcp_to_mcp2)
+    # 计算mcp_joint到mcp_joint_3的变换矩阵
+    mcp_to_mcp3 = torch.matmul(torch.inverse(mcp), mcp_3)
+    print('mcp_to_mcp3:',mcp_to_mcp3)
+    # scene = trimesh.Scene()
+    # mesh = robot.get_forward_robot_mesh(
+    #     torch.from_numpy(np.identity(4)).to(device).reshape(-1, 4, 4).expand(1,-1,-1).float(),
+    #     torch.zeros(1,robot.dof).float().to(device)
+    # )[0]
+    # scene.add_geometry(mesh)
+    # scene.show()
     # # show robot
     # # theta = panda.theta_min + (panda.theta_max-panda.theta_min)*0.5
     # # theta = torch.tensor([0, 0.8, -0.0, -2.3, -2.8, 1.5, np.pi/4.0]).float().to(device).reshape(-1,7)

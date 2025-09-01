@@ -15,7 +15,7 @@ from mlp import MLPRegression
 import torch.nn.functional as F
 import mesh_to_sdf
 import skimage
-from panda_layer.panda_layer import PandaLayer
+from RDF.panda_layer.panda_layer_ import PandaLayer
 import utils
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -12,7 +12,7 @@ import os
 import numpy as np
 import trimesh
 import yaml
-from panda_layer.panda_layer import PandaLayer
+from RDF.panda_layer.panda_layer_ import PandaLayer
 import utils
 
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))

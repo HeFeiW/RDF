@@ -249,12 +249,9 @@ class RobotLayer(torch.nn.Module):
         return meshes
 
     def get_forward_robot_mesh(self, pose, theta):
-        batch_size = pose.size()[0]
-        vertices, normals = self.forward(pose, theta)
+        vertices, _ = self.forward(pose, theta)
         # vertices : (link, (B, Nv, 3))
         # normals : (link, (B, Nv, 3))
-        # print(f'vertices keys: {vertices.keys()}')
-        # print(f'self.Link2Mesh keys: {self.Link2Mesh.keys()}')
         for k in vertices.keys():
             B = vertices[k].shape[0]
             break

@@ -15,11 +15,12 @@ import trimesh
 import utils
 import mesh_to_sdf
 import skimage
-from panda_layer.panda_layer import PandaLayer
-from panda_layer.robot_layer import RobotLayer
+import sys
+sys.path.append(os.path.join(CUR_DIR,'../panda_layer'))
+from panda_layer import PandaLayer
+from robot_layer import RobotLayer
 import argparse
 
-CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class BPSDF():
     def __init__(self, n_func,domain_min,domain_max,robot,paths,device):
@@ -242,10 +243,6 @@ class BPSDF():
             fk_rotation = trans[:,:3,:3]
             gradient_base_frame = torch.einsum('ijk,ikl->ijl',fk_rotation,gradient.transpose(1,2)).transpose(1,2).reshape(B,K,N,3)
             # norm_gradient_base_frame = torch.linalg.norm(gradient_base_frame,dim=-1)
-
-            # exit()
-            # print(norm_gradient_base_frame)
-
             idx_grad = idx.unsqueeze(1).unsqueeze(-1).expand(B,K,N,3)
             gradient_value = torch.gather(gradient_base_frame,1,idx_grad)[:,0,:,:]
             # gradient_value = None
@@ -317,7 +314,7 @@ if __name__ =='__main__':
         model = torch.load(paths['model'])
         # print('model loaded!',model.keys())
         # visualize the Bernstein Polynomial model for each robot link
-        bp_sdf.create_surface_mesh(model,nbData=128,vis=False,save_mesh_name=f'BP_{args.n_func}')
+        bp_sdf.create_surface_mesh(model,nbData=128,vis=True,save_mesh_name=f'BP_{args.n_func}')
 
         # visualize the Bernstein Polynomial model for the whole body
         B=11

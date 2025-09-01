@@ -10,8 +10,9 @@
 
 import torch
 import os
-from panda_layer.robot_layer import RobotLayer
-import bf_sdf
+from panda_layer.parallel_robot_layer import ParallelRobotLayer
+from panda_layer.serial_robot_layer import SerialRobotLayer
+from parallel_bf_sdf import ParallelBPSDF
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
@@ -199,19 +200,46 @@ def plot_sdf_shell(robot,bp_sdf,pose,theta,model,device,distance=0.0):
     sdf,_ = bp_sdf.get_whole_body_sdf_batch(points,pose,theta,model,use_derivative=False)
     sdf = sdf.squeeze().detach().cpu().numpy()
     th = (space_limits.max() - space_limits.min()).mean() / 50.0
-    print(th)
+    print(f'th: {th}, distance: {distance}')
     choice = ((sdf-distance)<th) * ((sdf-distance)>-th)
+    print(f'whole body has {choice.sum()} points on the shell')
     points = points[choice]
     sdf = sdf[choice]
-    print(points.shape,sdf.shape)
 
     scene = trimesh.Scene()
-    # robot_mesh = robot.get_forward_robot_mesh(pose, theta)[0]
+    robot_mesh = robot.get_forward_robot_mesh(pose, theta)[0]
     robot_mesh = np.sum(robot_mesh)
     scene.add_geometry(robot_mesh)
-    # pc =trimesh.PointCloud(points.detach().cpu().numpy(),colors = [255,0,0,150])
-    # scene.add_geometry(pc)
+    pc =trimesh.PointCloud(points.detach().cpu().numpy(),colors = [255,0,0,150])
+    scene.add_geometry(pc)
     scene.show()
+def plot_serial_sdf_shell(robot,bp_sdf,pose,theta,model,device,distance=0.0):
+    space_limits = robot.space_limits.cpu().numpy()
+    N = 100000
+    points = np.random.rand(N,3) * (space_limits[1]-space_limits[0]) + space_limits[0]
+    points = torch.from_numpy(points).float().to(device)
+    for i,serial in enumerate(robot.serials):
+        theta_serial = torch.stack([theta[:,robot.Joint2Idx[joint]] for joint in serial.Joint2Idx.keys()],dim=-1)
+        sdf,_ = bp_sdf.get_serial_sdf_batch(points,pose,theta_serial,model,use_derivative=False,serial_idx=i)
+        sdf = sdf.squeeze().detach().cpu().numpy()
+        th = (space_limits.max() - space_limits.min()).mean() / 50.0
+        choice = ((sdf-distance)<th) * ((sdf-distance)>-th)
+        print(f'serial {i} has {choice.sum()} points on the shell')
+        near_points = points[choice]
+        sdf = sdf[choice]
+
+        scene = trimesh.Scene()
+        # robot_mesh = serial.get_forward_robot_mesh(pose, theta_serial)[0]
+        # robot_mesh = np.sum(robot_mesh)
+        # scene.add_geometry(robot_mesh)
+        pc =trimesh.PointCloud(near_points.detach().cpu().numpy(),colors = [255,0,0,150])
+        # # 增加一个立方体,区域为space_limits
+        # xmin, ymin, zmin = space_limits[0]
+        # xmax, ymax, zmax = space_limits[1]
+        # box = trimesh.creation.box(extents=[xmax-xmin, ymax-ymin, zmax-zmin], transform=trimesh.transformations.translation_matrix([(xmax+xmin)/2, (ymax+ymin)/2, (zmax+zmin)/2]), color=[0, 100, 0, 50])
+        # scene.add_geometry(box)
+        scene.add_geometry(pc)
+        scene.show()
 
 if __name__ =='__main__':
 
@@ -231,22 +259,29 @@ if __name__ =='__main__':
         'model':os.path.join(CUR_DIR, f'models/{args.robot}/BP_{args.n_func}.pt')
         }
 
-    robot = RobotLayer(device=args.device,paths=paths,robot=args.robot)
-    bp_sdf = bf_sdf.BPSDF(args.n_func,args.domain_min,args.domain_max,robot,paths,args.device)
+    robot = ParallelRobotLayer(device=args.device,paths=paths,robot=args.robot).to(args.device)
+    bp_sdf = ParallelBPSDF(n_func=args.n_func,
+                           domain_min=args.domain_min,
+                           domain_max=args.domain_max,
+                           robot=robot,
+                           device=args.device,
+                           paths=paths)
 
     #  load  model
-    model = torch.load(f'models/{args.robot}/BP_{args.n_func}.pt')
+    model = torch.load(paths['model'],map_location=args.device)
     
     # --- initialize theta ---
     device = args.device
-    theta = torch.randn([1,robot.dof]).to(device) * (robot.theta_max_soft - robot.theta_min_soft) + robot.theta_min_soft
-
-    # theta = torch.zeros([1,robot.dof]).to(device)
+    # theta = torch.randn([1,robot.dof]).to(device) * (robot.theta_max_soft - robot.theta_min_soft) + robot.theta_min_soft
+    theta = torch.zeros([1,robot.dof]).to(device)
+    theta[:,robot.Joint2Idx['joint_14']] = 1
     theta = theta.to(args.device).reshape(-1,robot.dof)
+    theta[:,robot.Joint2Idx['joint_2']] = 1.8
     pose = torch.from_numpy(np.identity(4)).unsqueeze(0).to(args.device).expand(len(theta),4,4).float()
     # # vis 2D SDF with gradient
     # plot_2D_panda_sdf(pose,theta,bp_sdf,nbData=80,model=model,device=args.device)
 
     # vis 3D SDF with gradient
     # plot_3D_panda_with_gradient(pose,theta,bp_sdf,model=model,device=args.device)
-    plot_sdf_shell(robot,bp_sdf,pose,theta,model,device=args.device,distance=0.3)
+    plot_sdf_shell(robot,bp_sdf,pose,theta,model,device=args.device,distance = 0.01)
+    plot_serial_sdf_shell(robot,bp_sdf,pose,theta,model,device=args.device,distance=0.01)
