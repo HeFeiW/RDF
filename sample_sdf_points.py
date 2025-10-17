@@ -39,7 +39,7 @@ for mf in mesh_files:
     
     mesh_name = mf.split('/')[-1].split('.')[0]
     print(mesh_name)
-    data_path = os.path.join(save_path,f'voxel_128_{mesh_name}.npy')
+    data_path = os.path.join(save_path,f'voxel_128_{mesh_name}_depth.npy')
     if os.path.exists(data_path):
         print(f"Data for {mf} already exists, skipping...")
         continue
@@ -65,12 +65,12 @@ for mf in mesh_files:
     random_sdf = mesh_to_sdf.mesh_to_sdf(mesh, 
                                      random_points, 
                                      surface_point_method='scan', 
-                                     sign_method='normal', 
+                                     sign_method='depth', 
                                      bounding_radius=None, 
                                      scan_count=100, 
                                      scan_resolution=400, 
                                      sample_point_count=10000000, 
-                                     normal_sample_count=100) 
+                                     normal_sample_count=100)
     
     # save data
     data = {

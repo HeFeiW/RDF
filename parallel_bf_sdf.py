@@ -133,6 +133,112 @@ class ParallelBPSDF():
             os.mkdir(folder)
         torch.save(mesh_dict,f"{self.paths['model']}") # save the robot sdf model
         print(f"{self.paths['model']} model saved!")
+    def train_bf_sdf_with_eikonal(self,epoches=200,mesh_path=None,point_path=None,lambda_eikonal=0.1):
+        # represent SDF using basis functions
+        mesh_dict = {}
+        for mesh_name in self.robot.Link2Mesh.values():
+            if mesh_name is None:
+                continue
+                
+            mesh = trimesh.Trimesh(self.robot.meshes[mesh_name][0][:,:3].cpu().detach().numpy(),
+                                self.robot.meshes[mesh_name][1])
+            offset = mesh.bounding_box.centroid
+            scale = np.max(np.linalg.norm(mesh.vertices-offset, axis=1))
+            mesh = mesh_to_sdf.scale_to_unit_sphere(mesh)
+            mesh_dict[mesh_name] = {}
+            mesh_dict[mesh_name]['mesh_name'] = mesh_name
+            
+            # load data
+            point_path = self.paths['points'] + f'voxel_128_{mesh_name}.npy'
+            data = np.load(point_path, allow_pickle=True).item()
+            point_near_data = data['near_points']
+            sdf_near_data = data['near_sdf']
+            point_random_data = data['random_points']
+            sdf_random_data = data['random_sdf']
+            
+            # Initialize weights and covariance matrix
+            wb = torch.zeros(self.n_func**3).float().to(self.device)
+            # wb: (n_func^3)
+            B = (torch.eye(self.n_func**3) / 1e-4).float().to(self.device)
+            
+            for iter in range(epoches):
+                # 1. Sample data points for SDF fitting
+                choice_near = np.random.choice(len(point_near_data), 512, replace=False)
+                p_near, sdf_near = torch.from_numpy(point_near_data[choice_near]).float().to(self.device), torch.from_numpy(sdf_near_data[choice_near]).float().to(self.device)
+                
+                choice_random = np.random.choice(len(point_random_data), 128, replace=False)
+                p_random, sdf_random = torch.from_numpy(point_random_data[choice_random]).float().to(self.device), torch.from_numpy(sdf_random_data[choice_random]).float().to(self.device)
+                
+                p_data = torch.cat([p_near, p_random], dim=0)
+                sdf_data = torch.cat([sdf_near, sdf_random], dim=0)
+                num_data = len(p_data)
+                # 3. Compute basis functions and derivatives for data points
+                phi_data, dphi_eikonal = self.build_basis_function_from_points(p_data, use_derivative=True)
+                
+                # phi_data: (num_data, n_func^3)
+                # dphi_eikonal: (num_data, n_func^3, 3)
+                
+                # 5. Linearize Eikonal constraint around current weights
+                with torch.no_grad():
+                    # Compute current gradient at Eikonal points
+                    current_grad = torch.matmul(dphi_eikonal.permute(0, 2, 1), wb.unsqueeze(-1)).squeeze(-1)  # (num_data, 3)
+                    grad_norm = torch.norm(current_grad, dim=1, keepdim=True)
+                    # Avoid division by zero
+                    epsilon = 1e-8
+                    unit_normals = current_grad / (grad_norm + epsilon) # (num_data, 3)
+                    
+                    # Construct linearized Eikonal measurement matrix
+                    # A_eikonal[i] = n_i^T * ∇φ(p_i)
+                    A_eikonal = torch.sum(unit_normals.unsqueeze(2) * dphi_eikonal.reshape(-1, 3, self.n_func**3), dim=1)
+                    # A_eikonal: (num_data, n_func^3)
+                    f_eikonal = torch.ones(num_data).float().to(self.device)
+                    # f_eikonal: (num_data)
+                
+                # 6. Combine data and Eikonal constraints
+                # Weight the Eikonal constraint by lambda_eikonal
+                sqrt_lambda = torch.sqrt(torch.tensor(lambda_eikonal)).float().to(self.device)
+                
+                # Stack the design matrices and target values
+                Phi_combined = torch.cat([phi_data, sqrt_lambda * A_eikonal], dim=0)
+                # Phi_combined: (num_data*2, n_func^3)
+                f_combined = torch.cat([sdf_data, sqrt_lambda * f_eikonal], dim=0)
+                # f_combined: (num_data*2)
+                
+                # 7. Perform RLS update
+                I = torch.eye(len(f_combined)).float().to(self.device)
+                K = torch.matmul(B, Phi_combined.T).matmul(
+                    torch.linalg.inv(I + torch.matmul(Phi_combined, torch.matmul(B, Phi_combined.T)))
+                )
+                # K: (n_func^3, num_data*2)
+                
+                # Update covariance matrix
+                B -= torch.matmul(K, torch.matmul(Phi_combined, B))
+                # B: (n_func^3, n_func^3)
+                
+                # Update weights
+                prediction = torch.matmul(Phi_combined, wb)
+                residual = f_combined - prediction
+                wb += torch.matmul(K, residual)
+                # Optional: Print progress
+                if iter % 50 == 0:
+                    data_loss = torch.nn.functional.mse_loss(torch.matmul(phi_data, wb).squeeze(), sdf_data, reduction='mean')
+                    eikonal_loss = torch.nn.functional.mse_loss(torch.norm(torch.matmul(dphi_eikonal.permute(0, 2, 1), wb.unsqueeze(-1)).squeeze(-1), dim=1), torch.ones(num_data).float().to(self.device), reduction='mean')
+                    print(f"Mesh {mesh_name}, Iter {iter}: Data Loss={data_loss.item():.4f}, Eikonal Loss={eikonal_loss.item():.4f}")
+
+            # Store results
+            mesh_dict[mesh_name] = {
+                'mesh_name': mesh_name,
+                'weights': wb,
+                'offset': torch.from_numpy(offset).to(self.device).float(),
+                'scale': scale,
+            }
+        
+        # Save the model
+        folder = os.path.dirname(self.paths['model'])
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        torch.save(mesh_dict, f"{self.paths['model']}")
+        print(f"{self.paths['model']} model saved with Eikonal constraint!")
 
     def sdf_to_mesh(self, model, nbData,use_derivative=False):
         verts_list, faces_list, mesh_name_list = [], [], []
@@ -280,24 +386,19 @@ class ParallelBPSDF():
         
         plt.tight_layout()
         plt.show()
+        # 保存图像
+        # save_path = os.path.join(CUR_DIR, "bp_sdf_check_img")
+        # if os.path.exists(save_path) is False:
+        #     os.mkdir(save_path)
+        # fig.savefig(os.path.join(save_path, f"SDF_Slice_{mesh_name}_{xyz}_{z_value:.2f}.png"))
+        
         
         # 打印诊断信息
         print(f"=== SDF Slice Analysis at Z = {z_value:.2f} ===")
         print(f"Mesh: {mesh_name}")
         print(f"SDF value range: [{sdf_grid.min():.4f}, {sdf_grid.max():.4f}]")
         print(f"Number of distinct zero contours: {len(zero_contour.collections[0].get_paths())}")
-        
-        # 检查是否有多个零等值线
-        zero_paths = zero_contour.collections[0].get_paths()
-        if len(zero_paths) > 1:
-            print("⚠️  WARNING: Multiple zero contours detected! This indicates potential 'ghost surfaces'.")
-            for i, path in enumerate(zero_paths):
-                if len(path.vertices) > 0:
-                    center = path.vertices.mean(axis=0)
-                    area = path.vertices.shape[0]  # 粗略估计轮廓大小
-                    print(f"  Zero contour {i+1}: center at ({center[0]:.3f}, {center[1]:.3f}), approx size: {area} points")
-        else:
-            print("✓ Only one zero contour detected - this is normal.")
+    
         
         return sdf_grid, zero_contour
 
@@ -337,12 +438,7 @@ class ParallelBPSDF():
             except Exception as e:
                 print(f"Error at Z = {z:.2f}: {e}")
                 continue
-        
-        if not ghost_detected:
-            print("\n✅ No ghost surfaces detected in the sampled slices.")
-        else:
-            print(f"\n🔍 Ghost surface found around Z = {z:.2f}. Recommend detailed investigation around this region.")
-
+            
     def check_eikonal_equation(self, model, mesh_path=None, nbData=1000):
         """
         检查SDF梯度是否满足Eikonal方程 |∇φ| = 1
@@ -431,11 +527,11 @@ class ParallelBPSDF():
             plt.tight_layout()
             plt.show()
             # 保存图像
-            save_path = os.path.join(CUR_DIR, "bp_eikonal_check_img")
-            if os.path.exists(save_path) is False:
-                os.mkdir(save_path)
-            fig.savefig(os.path.join(save_path, f"Eikonal_Check_{mesh_name}.png"))
-            print(f"Diagnostic plots saved to {save_path}")
+            # save_path = os.path.join(CUR_DIR, "bp_eikonal_check_img")
+            # if os.path.exists(save_path) is False:
+            #     os.mkdir(save_path)
+            # fig.savefig(os.path.join(save_path, f"Eikonal_Check_{mesh_name}.png"))
+            # print(f"Diagnostic plots saved to {save_path}")
             
             
     def get_whole_body_sdf_batch(self,x,pose,theta,model,use_derivative = True, used_links = None,return_index=False,serial = False):
@@ -793,35 +889,28 @@ if __name__ =='__main__':
         'urdf': os.path.join(CUR_DIR,f'descriptions/{args.robot}/*.urdf'),
         'meshes': os.path.join(CUR_DIR,f'descriptions/{args.robot}/meshes/*.stl'),
         'points': os.path.join(CUR_DIR,f'data/{args.robot}/sdf_points/'),
-        'model':os.path.join(CUR_DIR, f'models/{args.robot}/BP_{args.n_func}.pt')
+        'model':os.path.join(CUR_DIR, f'models/{args.robot}/BP_eik_{args.n_func}.pt')
         }
     # ---- initialize the paths depending on the robot ----
     robot = ParallelRobotLayer(device=args.device, robot=args.robot, paths=paths)
     bp_sdf = ParallelBPSDF(args.n_func,args.domain_min,args.domain_max,robot=robot,paths=paths,device=args.device)
     #  train Bernstein Polynomial model 
     if args.train:
-        bp_sdf.train_bf_sdf(mesh_path=paths['meshes'], epoches=200)
+        # bp_sdf.train_bf_sdf(mesh_path=paths['meshes'], epoches=200)
+        bp_sdf.train_bf_sdf_with_eikonal(mesh_path=paths['meshes'], epoches=200, lambda_eikonal=0.1)
     if args.eval:
         # load trained model
         model = torch.load(paths['model'])
         # --debug check ghost surface ---        
-        # 选择有问题的网格名称
-        problematic_mesh_name = input("Enter the problematic mesh name (e.g., 'link7_mesh'): ")
-        if problematic_mesh_name not in robot.Link2Mesh.values():
-            print(f"Mesh name '{problematic_mesh_name}' not found in the robot model.")
-            exit()
+        
         
         # evaluation: 检查梯度是否满足Eikonal方程
         bp_sdf.check_eikonal_equation(model,mesh_path=paths['meshes'],nbData=1000)
-        exit()
-        # 方法1：在特定Z值切片查看
-        bp_sdf.visualize_sdf_slice(model, problematic_mesh_name, z_value=0.0, nbData=100)
-        
-        # 方法2：在多个Z值搜索幽灵面
-        bp_sdf.find_ghost_surface_z_values(model, problematic_mesh_name, num_slices=20)
+        for mesh_name in model.keys():
+            bp_sdf.find_ghost_surface_z_values(model, mesh_name, num_slices=20)
         
         # visualize the Bernstein Polynomial model for each robot link
-        bp_sdf.create_surface_mesh(model,nbData=128,vis=True,save_mesh_name=f'BP_{args.n_func}')
+        bp_sdf.create_surface_mesh(model,nbData=128,vis=True)
         exit()
 
         # visualize the Bernstein Polynomial model for the whole body
